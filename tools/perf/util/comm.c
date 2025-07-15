@@ -5,6 +5,8 @@
 #include <internal/rc_check.h>
 #include <linux/refcount.h>
 #include <linux/zalloc.h>
+#include <tools/libc_compat.h> // reallocarray
+
 #include "rwsem.h"
 
 DECLARE_RC_STRUCT(comm_str) {
@@ -86,14 +88,6 @@ static struct comm_str *comm_str__new(const char *str)
 	return result;
 }
 
-static int comm_str__cmp(const void *_lhs, const void *_rhs)
-{
-	const struct comm_str *lhs = *(const struct comm_str * const *)_lhs;
-	const struct comm_str *rhs = *(const struct comm_str * const *)_rhs;
-
-	return strcmp(comm_str__str(lhs), comm_str__str(rhs));
-}
-
 static int comm_str__search(const void *_key, const void *_member)
 {
 	const char *key = _key;
@@ -169,9 +163,24 @@ static struct comm_str *comm_strs__findnew(const char *str)
 		}
 		result = comm_str__new(str);
 		if (result) {
-			comm_strs->strs[comm_strs->num_strs++] = result;
-			qsort(comm_strs->strs, comm_strs->num_strs, sizeof(struct comm_str *),
-			      comm_str__cmp);
+			int low = 0, high = comm_strs->num_strs - 1;
+			int insert = comm_strs->num_strs; /* Default to inserting at the end. */
+
+			while (low <= high) {
+				int mid = low + (high - low) / 2;
+				int cmp = strcmp(comm_str__str(comm_strs->strs[mid]), str);
+
+				if (cmp < 0) {
+					low = mid + 1;
+				} else {
+					high = mid - 1;
+					insert = mid;
+				}
+			}
+			memmove(&comm_strs->strs[insert + 1], &comm_strs->strs[insert],
+				(comm_strs->num_strs - insert) * sizeof(struct comm_str *));
+			comm_strs->num_strs++;
+			comm_strs->strs[insert] = result;
 		}
 	}
 	up_write(&comm_strs->lock);

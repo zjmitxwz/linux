@@ -97,7 +97,7 @@ cleanup() {
 }
 
 server_listen() {
-	ip netns exec "$ns2" socat -u -4 TCP-LISTEN:8080,reuseaddr STDOUT > "${outfile}" &
+	ip netns exec "$ns2" timeout 5 socat -u -4 TCP-LISTEN:8080,reuseaddr STDOUT > "${outfile}" &
 	server_pid=$!
 	sleep 0.2
 }
@@ -129,9 +129,6 @@ test_dr() {
 	# avoid incorrect arp response
 	ip netns exec "${ns2}" sysctl -qw net.ipv4.conf.all.arp_ignore=1
 	ip netns exec "${ns2}" sysctl -qw net.ipv4.conf.all.arp_announce=2
-	# avoid reverse route lookup
-	ip netns exec "${ns2}" sysctl -qw  net.ipv4.conf.all.rp_filter=0
-	ip netns exec "${ns2}" sysctl -qw  net.ipv4.conf.veth21.rp_filter=0
 	ip netns exec "${ns2}" ip addr add "${vip_v4}/32" dev lo:1
 
 	test_service
@@ -167,9 +164,6 @@ test_tun() {
 	ip netns exec "${ns2}" ip link set tunl0 up
 	ip netns exec "${ns2}" sysctl -qw net.ipv4.conf.all.arp_ignore=1
 	ip netns exec "${ns2}" sysctl -qw net.ipv4.conf.all.arp_announce=2
-	ip netns exec "${ns2}" sysctl -qw net.ipv4.conf.all.rp_filter=0
-	ip netns exec "${ns2}" sysctl -qw net.ipv4.conf.tunl0.rp_filter=0
-	ip netns exec "${ns2}" sysctl -qw net.ipv4.conf.veth21.rp_filter=0
 	ip netns exec "${ns2}" ip addr add "${vip_v4}/32" dev lo:1
 
 	test_service

@@ -15,6 +15,14 @@
 #define __array(name, val) typeof(val) *name[]
 #define __ulong(name, val) enum { ___bpf_concat(__unique_value, __COUNTER__) = val } name
 
+#ifndef likely
+#define likely(x)      (__builtin_expect(!!(x), 1))
+#endif
+
+#ifndef unlikely
+#define unlikely(x)    (__builtin_expect(!!(x), 0))
+#endif
+
 /*
  * Helper macro to place programs, maps, license in
  * different sections in elf_bpf file. Section names
@@ -185,6 +193,7 @@ enum libbpf_tristate {
 #define __kptr_untrusted __attribute__((btf_type_tag("kptr_untrusted")))
 #define __kptr __attribute__((btf_type_tag("kptr")))
 #define __percpu_kptr __attribute__((btf_type_tag("percpu_kptr")))
+#define __uptr __attribute__((btf_type_tag("uptr")))
 
 #if defined (__clang__)
 #define bpf_ksym_exists(sym) ({						\
@@ -341,7 +350,7 @@ extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __weak __ksym;
  * I.e., it looks almost like high-level for each loop in other languages,
  * supports continue/break, and is verifiable by BPF verifier.
  *
- * For iterating integers, the difference betwen bpf_for_each(num, i, N, M)
+ * For iterating integers, the difference between bpf_for_each(num, i, N, M)
  * and bpf_for(i, N, M) is in that bpf_for() provides additional proof to
  * verifier that i is in [N, M) range, and in bpf_for_each() case i is `int
  * *`, not just `int`. So for integers bpf_for() is more convenient.

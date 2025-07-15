@@ -4,6 +4,7 @@
 #include <argp.h>
 #include <unistd.h>
 #include <stdint.h>
+#include "bpf_util.h"
 #include "bench.h"
 #include "trigger_bench.skel.h"
 #include "trace_helpers.h"
@@ -72,7 +73,7 @@ static __always_inline void inc_counter(struct counter *counters)
 	unsigned slot;
 
 	if (unlikely(tid == 0))
-		tid = syscall(SYS_gettid);
+		tid = sys_gettid();
 
 	/* multiplicative hashing, it's fast */
 	slot = 2654435769U * tid;
@@ -276,7 +277,7 @@ static void trigger_rawtp_setup(void)
  * instructions. So use two different targets, one of which starts with nop
  * and another doesn't.
  *
- * GCC doesn't generate stack setup preample for these functions due to them
+ * GCC doesn't generate stack setup preamble for these functions due to them
  * having no input arguments and doing nothing in the body.
  */
 __nocf_check __weak void uprobe_target_nop(void)
@@ -332,7 +333,21 @@ static void *uprobe_producer_ret(void *input)
 	return NULL;
 }
 
-static void usetup(bool use_retprobe, void *target_addr)
+#ifdef __x86_64__
+__nocf_check __weak void uprobe_target_nop5(void)
+{
+	asm volatile (".byte 0x0f, 0x1f, 0x44, 0x00, 0x00");
+}
+
+static void *uprobe_producer_nop5(void *input)
+{
+	while (true)
+		uprobe_target_nop5();
+	return NULL;
+}
+#endif
+
+static void usetup(bool use_retprobe, bool use_multi, void *target_addr)
 {
 	size_t uprobe_offset;
 	struct bpf_link *link;
@@ -346,7 +361,10 @@ static void usetup(bool use_retprobe, void *target_addr)
 		exit(1);
 	}
 
-	bpf_program__set_autoload(ctx.skel->progs.bench_trigger_uprobe, true);
+	if (use_multi)
+		bpf_program__set_autoload(ctx.skel->progs.bench_trigger_uprobe_multi, true);
+	else
+		bpf_program__set_autoload(ctx.skel->progs.bench_trigger_uprobe, true);
 
 	err = trigger_bench__load(ctx.skel);
 	if (err) {
@@ -355,16 +373,28 @@ static void usetup(bool use_retprobe, void *target_addr)
 	}
 
 	uprobe_offset = get_uprobe_offset(target_addr);
-	link = bpf_program__attach_uprobe(ctx.skel->progs.bench_trigger_uprobe,
-					  use_retprobe,
-					  -1 /* all PIDs */,
-					  "/proc/self/exe",
-					  uprobe_offset);
+	if (use_multi) {
+		LIBBPF_OPTS(bpf_uprobe_multi_opts, opts,
+			.retprobe = use_retprobe,
+			.cnt = 1,
+			.offsets = &uprobe_offset,
+		);
+		link = bpf_program__attach_uprobe_multi(
+			ctx.skel->progs.bench_trigger_uprobe_multi,
+			-1 /* all PIDs */, "/proc/self/exe", NULL, &opts);
+		ctx.skel->links.bench_trigger_uprobe_multi = link;
+	} else {
+		link = bpf_program__attach_uprobe(ctx.skel->progs.bench_trigger_uprobe,
+						  use_retprobe,
+						  -1 /* all PIDs */,
+						  "/proc/self/exe",
+						  uprobe_offset);
+		ctx.skel->links.bench_trigger_uprobe = link;
+	}
 	if (!link) {
-		fprintf(stderr, "failed to attach uprobe!\n");
+		fprintf(stderr, "failed to attach %s!\n", use_multi ? "multi-uprobe" : "uprobe");
 		exit(1);
 	}
-	ctx.skel->links.bench_trigger_uprobe = link;
 }
 
 static void usermode_count_setup(void)
@@ -374,33 +404,85 @@ static void usermode_count_setup(void)
 
 static void uprobe_nop_setup(void)
 {
-	usetup(false, &uprobe_target_nop);
+	usetup(false, false /* !use_multi */, &uprobe_target_nop);
 }
 
 static void uretprobe_nop_setup(void)
 {
-	usetup(true, &uprobe_target_nop);
+	usetup(true, false /* !use_multi */, &uprobe_target_nop);
 }
 
 static void uprobe_push_setup(void)
 {
-	usetup(false, &uprobe_target_push);
+	usetup(false, false /* !use_multi */, &uprobe_target_push);
 }
 
 static void uretprobe_push_setup(void)
 {
-	usetup(true, &uprobe_target_push);
+	usetup(true, false /* !use_multi */, &uprobe_target_push);
 }
 
 static void uprobe_ret_setup(void)
 {
-	usetup(false, &uprobe_target_ret);
+	usetup(false, false /* !use_multi */, &uprobe_target_ret);
 }
 
 static void uretprobe_ret_setup(void)
 {
-	usetup(true, &uprobe_target_ret);
+	usetup(true, false /* !use_multi */, &uprobe_target_ret);
 }
+
+static void uprobe_multi_nop_setup(void)
+{
+	usetup(false, true /* use_multi */, &uprobe_target_nop);
+}
+
+static void uretprobe_multi_nop_setup(void)
+{
+	usetup(true, true /* use_multi */, &uprobe_target_nop);
+}
+
+static void uprobe_multi_push_setup(void)
+{
+	usetup(false, true /* use_multi */, &uprobe_target_push);
+}
+
+static void uretprobe_multi_push_setup(void)
+{
+	usetup(true, true /* use_multi */, &uprobe_target_push);
+}
+
+static void uprobe_multi_ret_setup(void)
+{
+	usetup(false, true /* use_multi */, &uprobe_target_ret);
+}
+
+static void uretprobe_multi_ret_setup(void)
+{
+	usetup(true, true /* use_multi */, &uprobe_target_ret);
+}
+
+#ifdef __x86_64__
+static void uprobe_nop5_setup(void)
+{
+	usetup(false, false /* !use_multi */, &uprobe_target_nop5);
+}
+
+static void uretprobe_nop5_setup(void)
+{
+	usetup(true, false /* !use_multi */, &uprobe_target_nop5);
+}
+
+static void uprobe_multi_nop5_setup(void)
+{
+	usetup(false, true /* use_multi */, &uprobe_target_nop5);
+}
+
+static void uretprobe_multi_nop5_setup(void)
+{
+	usetup(true, true /* use_multi */, &uprobe_target_nop5);
+}
+#endif
 
 const struct bench bench_trig_syscall_count = {
 	.name = "trig-syscall-count",
@@ -454,3 +536,15 @@ BENCH_TRIG_USERMODE(uprobe_ret, ret, "uprobe-ret");
 BENCH_TRIG_USERMODE(uretprobe_nop, nop, "uretprobe-nop");
 BENCH_TRIG_USERMODE(uretprobe_push, push, "uretprobe-push");
 BENCH_TRIG_USERMODE(uretprobe_ret, ret, "uretprobe-ret");
+BENCH_TRIG_USERMODE(uprobe_multi_nop, nop, "uprobe-multi-nop");
+BENCH_TRIG_USERMODE(uprobe_multi_push, push, "uprobe-multi-push");
+BENCH_TRIG_USERMODE(uprobe_multi_ret, ret, "uprobe-multi-ret");
+BENCH_TRIG_USERMODE(uretprobe_multi_nop, nop, "uretprobe-multi-nop");
+BENCH_TRIG_USERMODE(uretprobe_multi_push, push, "uretprobe-multi-push");
+BENCH_TRIG_USERMODE(uretprobe_multi_ret, ret, "uretprobe-multi-ret");
+#ifdef __x86_64__
+BENCH_TRIG_USERMODE(uprobe_nop5, nop5, "uprobe-nop5");
+BENCH_TRIG_USERMODE(uretprobe_nop5, nop5, "uretprobe-nop5");
+BENCH_TRIG_USERMODE(uprobe_multi_nop5, nop5, "uprobe-multi-nop5");
+BENCH_TRIG_USERMODE(uretprobe_multi_nop5, nop5, "uretprobe-multi-nop5");
+#endif

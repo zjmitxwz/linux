@@ -1162,6 +1162,7 @@ cpt:
 	}
 
 	rvu_program_channels(rvu);
+	cgx_start_linkup(rvu);
 
 	err = rvu_mcs_init(rvu);
 	if (err) {
@@ -1392,8 +1393,6 @@ static void rvu_detach_block(struct rvu *rvu, int pcifunc, int blktype)
 	if (blkaddr < 0)
 		return;
 
-	if (blktype == BLKTYPE_NIX)
-		rvu_nix_reset_mac(pfvf, pcifunc);
 
 	block = &hw->block[blkaddr];
 
@@ -1406,6 +1405,10 @@ static void rvu_detach_block(struct rvu *rvu, int pcifunc, int blktype)
 		if (lf < 0) /* This should never happen */
 			continue;
 
+		if (blktype == BLKTYPE_NIX) {
+			rvu_nix_reset_mac(pfvf, pcifunc);
+			rvu_npc_clear_ucast_entry(rvu, pcifunc, lf);
+		}
 		/* Disable the LF */
 		rvu_write64(rvu, blkaddr, block->lfcfg_reg |
 			    (lf << block->lfshift), 0x00ULL);
@@ -1643,7 +1646,7 @@ static int rvu_check_rsrc_availability(struct rvu *rvu,
 		if (req->ssow > block->lf.max) {
 			dev_err(&rvu->pdev->dev,
 				"Func 0x%x: Invalid SSOW req, %d > max %d\n",
-				 pcifunc, req->sso, block->lf.max);
+				 pcifunc, req->ssow, block->lf.max);
 			return -EINVAL;
 		}
 		mappedlfs = rvu_get_rsrc_mapcount(pfvf, block->addr);
@@ -2014,6 +2017,13 @@ int rvu_mbox_handler_vf_flr(struct rvu *rvu, struct msg_req *req,
 	return 0;
 }
 
+int rvu_ndc_sync(struct rvu *rvu, int lfblkaddr, int lfidx, u64 lfoffset)
+{
+	/* Sync cached info for this LF in NDC to LLC/DRAM */
+	rvu_write64(rvu, lfblkaddr, lfoffset, BIT_ULL(12) | lfidx);
+	return rvu_poll_reg(rvu, lfblkaddr, lfoffset, BIT_ULL(12), true);
+}
+
 int rvu_mbox_handler_get_hw_cap(struct rvu *rvu, struct msg_req *req,
 				struct get_hw_cap_rsp *rsp)
 {
@@ -2022,6 +2032,9 @@ int rvu_mbox_handler_get_hw_cap(struct rvu *rvu, struct msg_req *req,
 	rsp->nix_fixed_txschq_mapping = hw->cap.nix_fixed_txschq_mapping;
 	rsp->nix_shaping = hw->cap.nix_shaping;
 	rsp->npc_hash_extract = hw->cap.npc_hash_extract;
+
+	if (rvu->mcs_blk_cnt)
+		rsp->hw_caps = HW_CAP_MACSEC;
 
 	return 0;
 }
@@ -2068,6 +2081,65 @@ int rvu_mbox_handler_set_vf_perm(struct rvu *rvu, struct set_vf_perm *req,
 	return 0;
 }
 
+int rvu_mbox_handler_ndc_sync_op(struct rvu *rvu,
+				 struct ndc_sync_op *req,
+				 struct msg_rsp *rsp)
+{
+	struct rvu_hwinfo *hw = rvu->hw;
+	u16 pcifunc = req->hdr.pcifunc;
+	int err, lfidx, lfblkaddr;
+
+	if (req->npa_lf_sync) {
+		/* Get NPA LF data */
+		lfblkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPA, pcifunc);
+		if (lfblkaddr < 0)
+			return NPA_AF_ERR_AF_LF_INVALID;
+
+		lfidx = rvu_get_lf(rvu, &hw->block[lfblkaddr], pcifunc, 0);
+		if (lfidx < 0)
+			return NPA_AF_ERR_AF_LF_INVALID;
+
+		/* Sync NPA NDC */
+		err = rvu_ndc_sync(rvu, lfblkaddr,
+				   lfidx, NPA_AF_NDC_SYNC);
+		if (err)
+			dev_err(rvu->dev,
+				"NDC-NPA sync failed for LF %u\n", lfidx);
+	}
+
+	if (!req->nix_lf_tx_sync && !req->nix_lf_rx_sync)
+		return 0;
+
+	/* Get NIX LF data */
+	lfblkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, pcifunc);
+	if (lfblkaddr < 0)
+		return NIX_AF_ERR_AF_LF_INVALID;
+
+	lfidx = rvu_get_lf(rvu, &hw->block[lfblkaddr], pcifunc, 0);
+	if (lfidx < 0)
+		return NIX_AF_ERR_AF_LF_INVALID;
+
+	if (req->nix_lf_tx_sync) {
+		/* Sync NIX TX NDC */
+		err = rvu_ndc_sync(rvu, lfblkaddr,
+				   lfidx, NIX_AF_NDC_TX_SYNC);
+		if (err)
+			dev_err(rvu->dev,
+				"NDC-NIX-TX sync fail for LF %u\n", lfidx);
+	}
+
+	if (req->nix_lf_rx_sync) {
+		/* Sync NIX RX NDC */
+		err = rvu_ndc_sync(rvu, lfblkaddr,
+				   lfidx, NIX_AF_NDC_RX_SYNC);
+		if (err)
+			dev_err(rvu->dev,
+				"NDC-NIX-RX sync failed for LF %u\n", lfidx);
+	}
+
+	return 0;
+}
+
 static int rvu_process_mbox_msg(struct otx2_mbox *mbox, int devid,
 				struct mbox_msghdr *req)
 {
@@ -2106,7 +2178,7 @@ static int rvu_process_mbox_msg(struct otx2_mbox *mbox, int devid,
 		if (rsp && err)						\
 			rsp->hdr.rc = err;				\
 									\
-		trace_otx2_msg_process(mbox->pdev, _id, err);		\
+		trace_otx2_msg_process(mbox->pdev, _id, err, req->pcifunc); \
 		return rsp ? err : -ENOMEM;				\
 	}
 MBOX_MESSAGES
@@ -2413,9 +2485,9 @@ static int rvu_mbox_init(struct rvu *rvu, struct mbox_wq_info *mw,
 		goto free_regions;
 	}
 
-	mw->mbox_wq = alloc_workqueue(name,
+	mw->mbox_wq = alloc_workqueue("%s",
 				      WQ_UNBOUND | WQ_HIGHPRI | WQ_MEM_RECLAIM,
-				      num);
+				      num, name);
 	if (!mw->mbox_wq) {
 		err = -ENOMEM;
 		goto unmap_regions;
@@ -2567,7 +2639,7 @@ static irqreturn_t rvu_mbox_intr_handler(int irq, void *rvu_irq)
 		rvupf_write64(rvu, RVU_PF_VFPF_MBOX_INTX(1), intr);
 
 		rvu_queue_work(&rvu->afvf_wq_info, 64, vfs, intr);
-		vfs -= 64;
+		vfs = 64;
 	}
 
 	intr = rvupf_read64(rvu, RVU_PF_VFPF_MBOX_INTX(0));

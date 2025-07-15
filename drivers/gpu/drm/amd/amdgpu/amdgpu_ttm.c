@@ -61,7 +61,7 @@
 #include "amdgpu_res_cursor.h"
 #include "bif/bif_4_1_d.h"
 
-MODULE_IMPORT_NS(DMA_BUF);
+MODULE_IMPORT_NS("DMA_BUF");
 
 #define AMDGPU_TTM_VRAM_MAX_DW_READ	((size_t)128)
 
@@ -295,8 +295,8 @@ int amdgpu_ttm_copy_mem_to_mem(struct amdgpu_device *adev,
 	struct amdgpu_res_cursor src_mm, dst_mm;
 	struct dma_fence *fence = NULL;
 	int r = 0;
-
 	uint32_t copy_flags = 0;
+	struct amdgpu_bo *abo_src, *abo_dst;
 
 	if (!adev->mman.buffer_funcs_enabled) {
 		DRM_ERROR("Trying to move memory with ring turned off.\n");
@@ -308,7 +308,8 @@ int amdgpu_ttm_copy_mem_to_mem(struct amdgpu_device *adev,
 
 	mutex_lock(&adev->mman.gtt_window_lock);
 	while (src_mm.remaining) {
-		uint64_t from, to, cur_size;
+		uint64_t from, to, cur_size, tiling_flags;
+		uint32_t num_type, data_format, max_com, write_compress_disable;
 		struct dma_fence *next;
 
 		/* Never copy more than 256MiB at once to avoid a timeout */
@@ -325,8 +326,28 @@ int amdgpu_ttm_copy_mem_to_mem(struct amdgpu_device *adev,
 		if (r)
 			goto error;
 
+		abo_src = ttm_to_amdgpu_bo(src->bo);
+		abo_dst = ttm_to_amdgpu_bo(dst->bo);
 		if (tmz)
 			copy_flags |= AMDGPU_COPY_FLAGS_TMZ;
+		if ((abo_src->flags & AMDGPU_GEM_CREATE_GFX12_DCC) &&
+		    (abo_src->tbo.resource->mem_type == TTM_PL_VRAM))
+			copy_flags |= AMDGPU_COPY_FLAGS_READ_DECOMPRESSED;
+		if ((abo_dst->flags & AMDGPU_GEM_CREATE_GFX12_DCC) &&
+		    (dst->mem->mem_type == TTM_PL_VRAM)) {
+			copy_flags |= AMDGPU_COPY_FLAGS_WRITE_COMPRESSED;
+			amdgpu_bo_get_tiling_flags(abo_dst, &tiling_flags);
+			max_com = AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_MAX_COMPRESSED_BLOCK);
+			num_type = AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_NUMBER_TYPE);
+			data_format = AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_DATA_FORMAT);
+			write_compress_disable =
+				AMDGPU_TILING_GET(tiling_flags, GFX12_DCC_WRITE_COMPRESS_DISABLE);
+			copy_flags |= (AMDGPU_COPY_FLAGS_SET(MAX_COMPRESSED, max_com) |
+				       AMDGPU_COPY_FLAGS_SET(NUMBER_TYPE, num_type) |
+				       AMDGPU_COPY_FLAGS_SET(DATA_FORMAT, data_format) |
+				       AMDGPU_COPY_FLAGS_SET(WRITE_COMPRESS_DISABLE,
+							     write_compress_disable));
+		}
 
 		r = amdgpu_copy_buffer(ring, from, to, cur_size, resv,
 				       &next, false, true, copy_flags);
@@ -795,7 +816,7 @@ static int amdgpu_ttm_tt_pin_userptr(struct ttm_device *bdev,
 	/* Map SG to device */
 	r = dma_map_sgtable(adev->dev, ttm->sg, direction, 0);
 	if (r)
-		goto release_sg;
+		goto release_sg_table;
 
 	/* convert SG to linear array of pages and dma addresses */
 	drm_prime_sg_to_dma_addr_array(ttm->sg, gtt->ttm.dma_address,
@@ -803,6 +824,8 @@ static int amdgpu_ttm_tt_pin_userptr(struct ttm_device *bdev,
 
 	return 0;
 
+release_sg_table:
+	sg_free_table(ttm->sg);
 release_sg:
 	kfree(ttm->sg);
 	ttm->sg = NULL;
@@ -845,8 +868,7 @@ static void amdgpu_ttm_gart_bind_gfx9_mqd(struct amdgpu_device *adev,
 	int num_xcc = max(1U, adev->gfx.num_xcc_per_xcp);
 	uint64_t page_idx, pages_per_xcc;
 	int i;
-	uint64_t ctrl_flags = (flags & ~AMDGPU_PTE_MTYPE_VG10_MASK) |
-			AMDGPU_PTE_MTYPE_VG10(AMDGPU_MTYPE_NC);
+	uint64_t ctrl_flags = AMDGPU_PTE_MTYPE_VG10(flags, AMDGPU_MTYPE_NC);
 
 	pages_per_xcc = total_pages;
 	do_div(pages_per_xcc, num_xcc);
@@ -1401,7 +1423,8 @@ static bool amdgpu_ttm_bo_eviction_valuable(struct ttm_buffer_object *bo,
 	 */
 	dma_resv_for_each_fence(&resv_cursor, bo->base.resv,
 				DMA_RESV_USAGE_BOOKKEEP, f) {
-		if (amdkfd_fence_check_mm(f, current->mm))
+		if (amdkfd_fence_check_mm(f, current->mm) &&
+		    !(place->flags & TTM_PL_FLAG_CONTIGUOUS))
 			return false;
 	}
 
@@ -1742,7 +1765,9 @@ static int amdgpu_ttm_reserve_tmr(struct amdgpu_device *adev)
 			amdgpu_atomfirmware_get_fw_reserved_fb_size(adev);
 
 	if (!adev->bios &&
-	    amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(9, 4, 3))
+	    (amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(9, 4, 3) ||
+	     amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(9, 4, 4) ||
+	     amdgpu_ip_version(adev, GC_HWIP, 0) == IP_VERSION(9, 5, 0)))
 		reserve_size = max(reserve_size, (uint32_t)280 << 20);
 	else if (!reserve_size)
 		reserve_size = DISCOVERY_TMR_OFFSET;
@@ -1831,6 +1856,7 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
 
 	mutex_init(&adev->mman.gtt_window_lock);
 
+	dma_set_max_seg_size(adev->dev, UINT_MAX);
 	/* No others user of address space so set it to 0 */
 	r = ttm_device_init(&adev->mman.bdev, &amdgpu_bo_driver, adev->dev,
 			       adev_to_drm(adev)->anon_inode->i_mapping,
@@ -1938,10 +1964,19 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
 	/* Compute GTT size, either based on TTM limit
 	 * or whatever the user passed on module init.
 	 */
-	if (amdgpu_gtt_size == -1)
-		gtt_size = ttm_tt_pages_limit() << PAGE_SHIFT;
-	else
-		gtt_size = (uint64_t)amdgpu_gtt_size << 20;
+	gtt_size = ttm_tt_pages_limit() << PAGE_SHIFT;
+	if (amdgpu_gtt_size != -1) {
+		uint64_t configured_size = (uint64_t)amdgpu_gtt_size << 20;
+
+		drm_warn(&adev->ddev,
+			"Configuring gttsize via module parameter is deprecated, please use ttm.pages_limit\n");
+		if (gtt_size != configured_size)
+			drm_warn(&adev->ddev,
+				"GTT size has been set as %llu but TTM size has been set as %llu, this is unusual\n",
+				configured_size, gtt_size);
+
+		gtt_size = configured_size;
+	}
 
 	/* Initialize GTT memory pool */
 	r = amdgpu_gtt_mgr_init(adev, gtt_size);
@@ -1952,7 +1987,12 @@ int amdgpu_ttm_init(struct amdgpu_device *adev)
 	DRM_INFO("amdgpu: %uM of GTT memory ready.\n",
 		 (unsigned int)(gtt_size / (1024 * 1024)));
 
-	/* Initiailize doorbell pool on PCI BAR */
+	if (adev->flags & AMD_IS_APU) {
+		if (adev->gmc.real_vram_size < gtt_size)
+			adev->apu_prefer_gtt = true;
+	}
+
+	/* Initialize doorbell pool on PCI BAR */
 	r = amdgpu_ttm_init_on_chip(adev, AMDGPU_PL_DOORBELL, adev->doorbell.size / PAGE_SIZE);
 	if (r) {
 		DRM_ERROR("Failed initializing doorbell heap.\n");
@@ -2041,9 +2081,12 @@ void amdgpu_ttm_fini(struct amdgpu_device *adev)
 	amdgpu_vram_mgr_fini(adev);
 	amdgpu_gtt_mgr_fini(adev);
 	amdgpu_preempt_mgr_fini(adev);
+	amdgpu_doorbell_fini(adev);
+
 	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_GDS);
 	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_GWS);
 	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_OA);
+	ttm_range_man_fini(&adev->mman.bdev, AMDGPU_PL_DOORBELL);
 	ttm_device_fini(&adev->mman.bdev);
 	adev->mman.initialized = false;
 	DRM_INFO("amdgpu: ttm finalized\n");
@@ -2254,7 +2297,7 @@ int amdgpu_ttm_clear_buffer(struct amdgpu_bo *bo,
 	struct amdgpu_ring *ring = adev->mman.buffer_funcs_ring;
 	struct amdgpu_res_cursor cursor;
 	u64 addr;
-	int r;
+	int r = 0;
 
 	if (!adev->mman.buffer_funcs_enabled)
 		return -EINVAL;

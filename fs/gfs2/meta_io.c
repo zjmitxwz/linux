@@ -30,9 +30,9 @@
 #include "util.h"
 #include "trace_gfs2.h"
 
-static int gfs2_aspace_writepage(struct page *page, struct writeback_control *wbc)
+static void gfs2_aspace_write_folio(struct folio *folio,
+		struct writeback_control *wbc)
 {
-	struct folio *folio = page_folio(page);
 	struct buffer_head *bh, *head;
 	int nr_underway = 0;
 	blk_opf_t write_flags = REQ_META | REQ_PRIO | wbc_to_write_flags(wbc);
@@ -66,8 +66,8 @@ static int gfs2_aspace_writepage(struct page *page, struct writeback_control *wb
 	} while ((bh = bh->b_this_page) != head);
 
 	/*
-	 * The page and its buffers are protected by PageWriteback(), so we can
-	 * drop the bh refcounts early.
+	 * The folio and its buffers are protected from truncation by
+	 * the writeback flag, so we can drop the bh refcounts early.
 	 */
 	BUG_ON(folio_test_writeback(folio));
 	folio_start_writeback(folio);
@@ -84,21 +84,31 @@ static int gfs2_aspace_writepage(struct page *page, struct writeback_control *wb
 
 	if (nr_underway == 0)
 		folio_end_writeback(folio);
+}
 
-	return 0;
+static int gfs2_aspace_writepages(struct address_space *mapping,
+		struct writeback_control *wbc)
+{
+	struct folio *folio = NULL;
+	int error;
+
+	while ((folio = writeback_iter(mapping, wbc, folio, &error)))
+		gfs2_aspace_write_folio(folio, wbc);
+
+	return error;
 }
 
 const struct address_space_operations gfs2_meta_aops = {
 	.dirty_folio	= block_dirty_folio,
 	.invalidate_folio = block_invalidate_folio,
-	.writepage = gfs2_aspace_writepage,
+	.writepages = gfs2_aspace_writepages,
 	.release_folio = gfs2_release_folio,
 };
 
 const struct address_space_operations gfs2_rgrp_aops = {
 	.dirty_folio	= block_dirty_folio,
 	.invalidate_folio = block_invalidate_folio,
-	.writepage = gfs2_aspace_writepage,
+	.writepages = gfs2_aspace_writepages,
 	.release_folio = gfs2_release_folio,
 };
 
@@ -122,7 +132,7 @@ struct buffer_head *gfs2_getbuf(struct gfs2_glock *gl, u64 blkno, int create)
 	unsigned int bufnum;
 
 	if (mapping == NULL)
-		mapping = &sdp->sd_aspace;
+		mapping = gfs2_aspace(sdp);
 
 	shift = PAGE_SHIFT - sdp->sd_sb.sb_bsize_shift;
 	index = blkno >> shift;             /* convert block to page */
@@ -188,15 +198,14 @@ struct buffer_head *gfs2_meta_new(struct gfs2_glock *gl, u64 blkno)
 
 static void gfs2_meta_read_endio(struct bio *bio)
 {
-	struct bio_vec *bvec;
-	struct bvec_iter_all iter_all;
+	struct folio_iter fi;
 
-	bio_for_each_segment_all(bvec, bio, iter_all) {
-		struct page *page = bvec->bv_page;
-		struct buffer_head *bh = page_buffers(page);
-		unsigned int len = bvec->bv_len;
+	bio_for_each_folio_all(fi, bio) {
+		struct folio *folio = fi.folio;
+		struct buffer_head *bh = folio_buffers(folio);
+		size_t len = fi.length;
 
-		while (bh_offset(bh) < bvec->bv_offset)
+		while (bh_offset(bh) < fi.offset)
 			bh = bh->b_this_page;
 		do {
 			struct buffer_head *next = bh->b_this_page;
@@ -222,7 +231,7 @@ static void gfs2_submit_bhs(blk_opf_t opf, struct buffer_head *bhs[], int num)
 		bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
 		while (num > 0) {
 			bh = *bhs;
-			if (!bio_add_page(bio, bh->b_page, bh->b_size, bh_offset(bh))) {
+			if (!bio_add_folio(bio, bh->b_folio, bh->b_size, bh_offset(bh))) {
 				BUG_ON(bio->bi_iter.bi_size == 0);
 				break;
 			}

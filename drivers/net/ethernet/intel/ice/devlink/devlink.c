@@ -6,9 +6,11 @@
 #include "ice.h"
 #include "ice_lib.h"
 #include "devlink.h"
+#include "port.h"
 #include "ice_eswitch.h"
 #include "ice_fw_update.h"
 #include "ice_dcb_lib.h"
+#include "ice_sf_eth.h"
 
 /* context for devlink info version reporting */
 struct ice_info_ctx {
@@ -366,14 +368,18 @@ static int ice_devlink_info_get(struct devlink *devlink,
 			}
 			break;
 		case ICE_VERSION_RUNNING:
-			err = devlink_info_version_running_put(req, key, ctx->buf);
+			err = devlink_info_version_running_put_ext(req, key,
+								   ctx->buf,
+								   DEVLINK_INFO_VERSION_TYPE_COMPONENT);
 			if (err) {
 				NL_SET_ERR_MSG_MOD(extack, "Unable to set running version");
 				goto out_free_ctx;
 			}
 			break;
 		case ICE_VERSION_STORED:
-			err = devlink_info_version_stored_put(req, key, ctx->buf);
+			err = devlink_info_version_stored_put_ext(req, key,
+								  ctx->buf,
+								  DEVLINK_INFO_VERSION_TYPE_COMPONENT);
 			if (err) {
 				NL_SET_ERR_MSG_MOD(extack, "Unable to set stored version");
 				goto out_free_ctx;
@@ -744,6 +750,7 @@ static void ice_traverse_tx_tree(struct devlink *devlink, struct ice_sched_node 
 				 struct ice_sched_node *tc_node, struct ice_pf *pf)
 {
 	struct devlink_rate *rate_node = NULL;
+	struct ice_dynamic_port *sf;
 	struct ice_vf *vf;
 	int i;
 
@@ -755,6 +762,7 @@ static void ice_traverse_tx_tree(struct devlink *devlink, struct ice_sched_node 
 		/* create root node */
 		rate_node = devl_rate_node_create(devlink, node, node->name, NULL);
 	} else if (node->vsi_handle &&
+		   pf->vsi[node->vsi_handle]->type == ICE_VSI_VF &&
 		   pf->vsi[node->vsi_handle]->vf) {
 		vf = pf->vsi[node->vsi_handle]->vf;
 		if (!vf->devlink_port.devlink_rate)
@@ -762,6 +770,16 @@ static void ice_traverse_tx_tree(struct devlink *devlink, struct ice_sched_node 
 			 * so we don't set rate_node
 			 */
 			devl_rate_leaf_create(&vf->devlink_port, node,
+					      node->parent->rate_node);
+	} else if (node->vsi_handle &&
+		   pf->vsi[node->vsi_handle]->type == ICE_VSI_SF &&
+		   pf->vsi[node->vsi_handle]->sf) {
+		sf = pf->vsi[node->vsi_handle]->sf;
+		if (!sf->devlink_port.devlink_rate)
+			/* leaf nodes doesn't have children
+			 * so we don't set rate_node
+			 */
+			devl_rate_leaf_create(&sf->devlink_port, node,
 					      node->parent->rate_node);
 	} else if (node->info.data.elem_type != ICE_AQC_ELEM_TYPE_LEAF &&
 		   node->parent->rate_node) {
@@ -794,10 +812,8 @@ int ice_devlink_rate_init_tx_topology(struct devlink *devlink, struct ice_vsi *v
 
 	tc_node = pi->root->children[0];
 	mutex_lock(&pi->sched_lock);
-	devl_lock(devlink);
 	for (i = 0; i < tc_node->num_children; i++)
 		ice_traverse_tx_tree(devlink, tc_node->children[i], tc_node, pf);
-	devl_unlock(devlink);
 	mutex_unlock(&pi->sched_lock);
 
 	return 0;
@@ -965,6 +981,9 @@ static int ice_devlink_rate_node_new(struct devlink_rate *rate_node, void **priv
 
 	/* preallocate memory for ice_sched_node */
 	node = devm_kzalloc(ice_hw_to_dev(pi->hw), sizeof(*node), GFP_KERNEL);
+	if (!node)
+		return -ENOMEM;
+
 	*priv = node;
 
 	return 0;
@@ -1186,6 +1205,25 @@ static int ice_devlink_set_parent(struct devlink_rate *devlink_rate,
 	return status;
 }
 
+static void ice_set_min_max_msix(struct ice_pf *pf)
+{
+	struct devlink *devlink = priv_to_devlink(pf);
+	union devlink_param_value val;
+	int err;
+
+	err = devl_param_driverinit_value_get(devlink,
+					      DEVLINK_PARAM_GENERIC_ID_MSIX_VEC_PER_PF_MIN,
+					      &val);
+	if (!err)
+		pf->msix.min = val.vu32;
+
+	err = devl_param_driverinit_value_get(devlink,
+					      DEVLINK_PARAM_GENERIC_ID_MSIX_VEC_PER_PF_MAX,
+					      &val);
+	if (!err)
+		pf->msix.max = val.vu32;
+}
+
 /**
  * ice_devlink_reinit_up - do reinit of the given PF
  * @pf: pointer to the PF struct
@@ -1195,9 +1233,18 @@ static int ice_devlink_reinit_up(struct ice_pf *pf)
 	struct ice_vsi *vsi = ice_get_main_vsi(pf);
 	int err;
 
+	err = ice_init_hw(&pf->hw);
+	if (err) {
+		dev_err(ice_pf_to_dev(pf), "ice_init_hw failed: %d\n", err);
+		return err;
+	}
+
+	/* load MSI-X values */
+	ice_set_min_max_msix(pf);
+
 	err = ice_init_dev(pf);
 	if (err)
-		return err;
+		goto unroll_hw_init;
 
 	vsi->flags = ICE_VSI_FLAG_INIT;
 
@@ -1220,6 +1267,8 @@ err_load:
 	rtnl_unlock();
 err_vsi_cfg:
 	ice_deinit_dev(pf);
+unroll_hw_init:
+	ice_deinit_hw(&pf->hw);
 	return err;
 }
 
@@ -1279,15 +1328,24 @@ static const struct devlink_ops ice_devlink_ops = {
 
 	.rate_leaf_parent_set = ice_devlink_set_parent,
 	.rate_node_parent_set = ice_devlink_set_parent,
+
+	.port_new = ice_devlink_port_new,
 };
+
+static const struct devlink_ops ice_sf_devlink_ops;
 
 static int
 ice_devlink_enable_roce_get(struct devlink *devlink, u32 id,
 			    struct devlink_param_gset_ctx *ctx)
 {
 	struct ice_pf *pf = devlink_priv(devlink);
+	struct iidc_rdma_core_dev_info *cdev;
 
-	ctx->val.vbool = pf->rdma_mode & IIDC_RDMA_PROTOCOL_ROCEV2 ? true : false;
+	cdev = pf->cdev_info;
+	if (!cdev)
+		return -ENODEV;
+
+	ctx->val.vbool = !!(cdev->rdma_protocol & IIDC_RDMA_PROTOCOL_ROCEV2);
 
 	return 0;
 }
@@ -1297,19 +1355,24 @@ static int ice_devlink_enable_roce_set(struct devlink *devlink, u32 id,
 				       struct netlink_ext_ack *extack)
 {
 	struct ice_pf *pf = devlink_priv(devlink);
+	struct iidc_rdma_core_dev_info *cdev;
 	bool roce_ena = ctx->val.vbool;
 	int ret;
 
+	cdev = pf->cdev_info;
+	if (!cdev)
+		return -ENODEV;
+
 	if (!roce_ena) {
 		ice_unplug_aux_dev(pf);
-		pf->rdma_mode &= ~IIDC_RDMA_PROTOCOL_ROCEV2;
+		cdev->rdma_protocol &= ~IIDC_RDMA_PROTOCOL_ROCEV2;
 		return 0;
 	}
 
-	pf->rdma_mode |= IIDC_RDMA_PROTOCOL_ROCEV2;
+	cdev->rdma_protocol |= IIDC_RDMA_PROTOCOL_ROCEV2;
 	ret = ice_plug_aux_dev(pf);
 	if (ret)
-		pf->rdma_mode &= ~IIDC_RDMA_PROTOCOL_ROCEV2;
+		cdev->rdma_protocol &= ~IIDC_RDMA_PROTOCOL_ROCEV2;
 
 	return ret;
 }
@@ -1320,11 +1383,16 @@ ice_devlink_enable_roce_validate(struct devlink *devlink, u32 id,
 				 struct netlink_ext_ack *extack)
 {
 	struct ice_pf *pf = devlink_priv(devlink);
+	struct iidc_rdma_core_dev_info *cdev;
+
+	cdev = pf->cdev_info;
+	if (!cdev)
+		return -ENODEV;
 
 	if (!test_bit(ICE_FLAG_RDMA_ENA, pf->flags))
 		return -EOPNOTSUPP;
 
-	if (pf->rdma_mode & IIDC_RDMA_PROTOCOL_IWARP) {
+	if (cdev->rdma_protocol & IIDC_RDMA_PROTOCOL_IWARP) {
 		NL_SET_ERR_MSG_MOD(extack, "iWARP is currently enabled. This device cannot enable iWARP and RoCEv2 simultaneously");
 		return -EOPNOTSUPP;
 	}
@@ -1337,8 +1405,13 @@ ice_devlink_enable_iw_get(struct devlink *devlink, u32 id,
 			  struct devlink_param_gset_ctx *ctx)
 {
 	struct ice_pf *pf = devlink_priv(devlink);
+	struct iidc_rdma_core_dev_info *cdev;
 
-	ctx->val.vbool = pf->rdma_mode & IIDC_RDMA_PROTOCOL_IWARP;
+	cdev = pf->cdev_info;
+	if (!cdev)
+		return -ENODEV;
+
+	ctx->val.vbool = !!(cdev->rdma_protocol & IIDC_RDMA_PROTOCOL_IWARP);
 
 	return 0;
 }
@@ -1348,19 +1421,24 @@ static int ice_devlink_enable_iw_set(struct devlink *devlink, u32 id,
 				     struct netlink_ext_ack *extack)
 {
 	struct ice_pf *pf = devlink_priv(devlink);
+	struct iidc_rdma_core_dev_info *cdev;
 	bool iw_ena = ctx->val.vbool;
 	int ret;
 
+	cdev = pf->cdev_info;
+	if (!cdev)
+		return -ENODEV;
+
 	if (!iw_ena) {
 		ice_unplug_aux_dev(pf);
-		pf->rdma_mode &= ~IIDC_RDMA_PROTOCOL_IWARP;
+		cdev->rdma_protocol &= ~IIDC_RDMA_PROTOCOL_IWARP;
 		return 0;
 	}
 
-	pf->rdma_mode |= IIDC_RDMA_PROTOCOL_IWARP;
+	cdev->rdma_protocol |= IIDC_RDMA_PROTOCOL_IWARP;
 	ret = ice_plug_aux_dev(pf);
 	if (ret)
-		pf->rdma_mode &= ~IIDC_RDMA_PROTOCOL_IWARP;
+		cdev->rdma_protocol &= ~IIDC_RDMA_PROTOCOL_IWARP;
 
 	return ret;
 }
@@ -1375,7 +1453,7 @@ ice_devlink_enable_iw_validate(struct devlink *devlink, u32 id,
 	if (!test_bit(ICE_FLAG_RDMA_ENA, pf->flags))
 		return -EOPNOTSUPP;
 
-	if (pf->rdma_mode & IIDC_RDMA_PROTOCOL_ROCEV2) {
+	if (pf->cdev_info->rdma_protocol & IIDC_RDMA_PROTOCOL_ROCEV2) {
 		NL_SET_ERR_MSG_MOD(extack, "RoCEv2 is currently enabled. This device cannot enable iWARP and RoCEv2 simultaneously");
 		return -EOPNOTSUPP;
 	}
@@ -1383,9 +1461,166 @@ ice_devlink_enable_iw_validate(struct devlink *devlink, u32 id,
 	return 0;
 }
 
+#define DEVLINK_LOCAL_FWD_DISABLED_STR "disabled"
+#define DEVLINK_LOCAL_FWD_ENABLED_STR "enabled"
+#define DEVLINK_LOCAL_FWD_PRIORITIZED_STR "prioritized"
+
+/**
+ * ice_devlink_local_fwd_mode_to_str - Get string for local_fwd mode.
+ * @mode: local forwarding for mode used in port_info struct.
+ *
+ * Return: Mode respective string or "Invalid".
+ */
+static const char *
+ice_devlink_local_fwd_mode_to_str(enum ice_local_fwd_mode mode)
+{
+	switch (mode) {
+	case ICE_LOCAL_FWD_MODE_ENABLED:
+		return DEVLINK_LOCAL_FWD_ENABLED_STR;
+	case ICE_LOCAL_FWD_MODE_PRIORITIZED:
+		return DEVLINK_LOCAL_FWD_PRIORITIZED_STR;
+	case ICE_LOCAL_FWD_MODE_DISABLED:
+		return DEVLINK_LOCAL_FWD_DISABLED_STR;
+	}
+
+	return "Invalid";
+}
+
+/**
+ * ice_devlink_local_fwd_str_to_mode - Get local_fwd mode from string name.
+ * @mode_str: local forwarding mode string.
+ *
+ * Return: Mode value or negative number if invalid.
+ */
+static int ice_devlink_local_fwd_str_to_mode(const char *mode_str)
+{
+	if (!strcmp(mode_str, DEVLINK_LOCAL_FWD_ENABLED_STR))
+		return ICE_LOCAL_FWD_MODE_ENABLED;
+	else if (!strcmp(mode_str, DEVLINK_LOCAL_FWD_PRIORITIZED_STR))
+		return ICE_LOCAL_FWD_MODE_PRIORITIZED;
+	else if (!strcmp(mode_str, DEVLINK_LOCAL_FWD_DISABLED_STR))
+		return ICE_LOCAL_FWD_MODE_DISABLED;
+
+	return -EINVAL;
+}
+
+/**
+ * ice_devlink_local_fwd_get - Get local_fwd parameter.
+ * @devlink: Pointer to the devlink instance.
+ * @id: The parameter ID to set.
+ * @ctx: Context to store the parameter value.
+ *
+ * Return: Zero.
+ */
+static int ice_devlink_local_fwd_get(struct devlink *devlink, u32 id,
+				     struct devlink_param_gset_ctx *ctx)
+{
+	struct ice_pf *pf = devlink_priv(devlink);
+	struct ice_port_info *pi;
+	const char *mode_str;
+
+	pi = pf->hw.port_info;
+	mode_str = ice_devlink_local_fwd_mode_to_str(pi->local_fwd_mode);
+	snprintf(ctx->val.vstr, sizeof(ctx->val.vstr), "%s", mode_str);
+
+	return 0;
+}
+
+/**
+ * ice_devlink_local_fwd_set - Set local_fwd parameter.
+ * @devlink: Pointer to the devlink instance.
+ * @id: The parameter ID to set.
+ * @ctx: Context to get the parameter value.
+ * @extack: Netlink extended ACK structure.
+ *
+ * Return: Zero.
+ */
+static int ice_devlink_local_fwd_set(struct devlink *devlink, u32 id,
+				     struct devlink_param_gset_ctx *ctx,
+				     struct netlink_ext_ack *extack)
+{
+	int new_local_fwd_mode = ice_devlink_local_fwd_str_to_mode(ctx->val.vstr);
+	struct ice_pf *pf = devlink_priv(devlink);
+	struct device *dev = ice_pf_to_dev(pf);
+	struct ice_port_info *pi;
+
+	pi = pf->hw.port_info;
+	if (pi->local_fwd_mode != new_local_fwd_mode) {
+		pi->local_fwd_mode = new_local_fwd_mode;
+		dev_info(dev, "Setting local_fwd to %s\n", ctx->val.vstr);
+		ice_schedule_reset(pf, ICE_RESET_CORER);
+	}
+
+	return 0;
+}
+
+/**
+ * ice_devlink_local_fwd_validate - Validate passed local_fwd parameter value.
+ * @devlink: Unused pointer to devlink instance.
+ * @id: The parameter ID to validate.
+ * @val: Value to validate.
+ * @extack: Netlink extended ACK structure.
+ *
+ * Supported values are:
+ * "enabled" - local_fwd is enabled, "disabled" - local_fwd is disabled
+ * "prioritized" - local_fwd traffic is prioritized in scheduling.
+ *
+ * Return: Zero when passed parameter value is supported. Negative value on
+ * error.
+ */
+static int ice_devlink_local_fwd_validate(struct devlink *devlink, u32 id,
+					  union devlink_param_value val,
+					  struct netlink_ext_ack *extack)
+{
+	if (ice_devlink_local_fwd_str_to_mode(val.vstr) < 0) {
+		NL_SET_ERR_MSG_MOD(extack, "Error: Requested value is not supported.");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int
+ice_devlink_msix_max_pf_validate(struct devlink *devlink, u32 id,
+				 union devlink_param_value val,
+				 struct netlink_ext_ack *extack)
+{
+	struct ice_pf *pf = devlink_priv(devlink);
+
+	if (val.vu32 > pf->hw.func_caps.common_cap.num_msix_vectors)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int
+ice_devlink_msix_min_pf_validate(struct devlink *devlink, u32 id,
+				 union devlink_param_value val,
+				 struct netlink_ext_ack *extack)
+{
+	if (val.vu32 < ICE_MIN_MSIX)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int ice_devlink_enable_rdma_validate(struct devlink *devlink, u32 id,
+					    union devlink_param_value val,
+					    struct netlink_ext_ack *extack)
+{
+	struct ice_pf *pf = devlink_priv(devlink);
+	bool new_state = val.vbool;
+
+	if (new_state && !test_bit(ICE_FLAG_RDMA_ENA, pf->flags))
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
 enum ice_param_id {
 	ICE_DEVLINK_PARAM_ID_BASE = DEVLINK_PARAM_GENERIC_ID_MAX,
 	ICE_DEVLINK_PARAM_ID_TX_SCHED_LAYERS,
+	ICE_DEVLINK_PARAM_ID_LOCAL_FWD,
 };
 
 static const struct devlink_param ice_dvl_rdma_params[] = {
@@ -1397,6 +1632,17 @@ static const struct devlink_param ice_dvl_rdma_params[] = {
 			      ice_devlink_enable_iw_get,
 			      ice_devlink_enable_iw_set,
 			      ice_devlink_enable_iw_validate),
+	DEVLINK_PARAM_GENERIC(ENABLE_RDMA, BIT(DEVLINK_PARAM_CMODE_DRIVERINIT),
+			      NULL, NULL, ice_devlink_enable_rdma_validate),
+};
+
+static const struct devlink_param ice_dvl_msix_params[] = {
+	DEVLINK_PARAM_GENERIC(MSIX_VEC_PER_PF_MAX,
+			      BIT(DEVLINK_PARAM_CMODE_DRIVERINIT),
+			      NULL, NULL, ice_devlink_msix_max_pf_validate),
+	DEVLINK_PARAM_GENERIC(MSIX_VEC_PER_PF_MIN,
+			      BIT(DEVLINK_PARAM_CMODE_DRIVERINIT),
+			      NULL, NULL, ice_devlink_msix_min_pf_validate),
 };
 
 static const struct devlink_param ice_dvl_sched_params[] = {
@@ -1407,6 +1653,12 @@ static const struct devlink_param ice_dvl_sched_params[] = {
 			     ice_devlink_tx_sched_layers_get,
 			     ice_devlink_tx_sched_layers_set,
 			     ice_devlink_tx_sched_layers_validate),
+	DEVLINK_PARAM_DRIVER(ICE_DEVLINK_PARAM_ID_LOCAL_FWD,
+			     "local_forwarding", DEVLINK_PARAM_TYPE_STRING,
+			     BIT(DEVLINK_PARAM_CMODE_RUNTIME),
+			     ice_devlink_local_fwd_get,
+			     ice_devlink_local_fwd_set,
+			     ice_devlink_local_fwd_validate),
 };
 
 static void ice_devlink_free(void *devlink_ptr)
@@ -1433,6 +1685,34 @@ struct ice_pf *ice_allocate_pf(struct device *dev)
 	/* Add an action to teardown the devlink when unwinding the driver */
 	if (devm_add_action_or_reset(dev, ice_devlink_free, devlink))
 		return NULL;
+
+	return devlink_priv(devlink);
+}
+
+/**
+ * ice_allocate_sf - Allocate devlink and return SF structure pointer
+ * @dev: the device to allocate for
+ * @pf: pointer to the PF structure
+ *
+ * Allocate a devlink instance for SF.
+ *
+ * Return: ice_sf_priv pointer to allocated memory or ERR_PTR in case of error
+ */
+struct ice_sf_priv *ice_allocate_sf(struct device *dev, struct ice_pf *pf)
+{
+	struct devlink *devlink;
+	int err;
+
+	devlink = devlink_alloc(&ice_sf_devlink_ops, sizeof(struct ice_sf_priv),
+				dev);
+	if (!devlink)
+		return ERR_PTR(-ENOMEM);
+
+	err = devl_nested_devlink_set(priv_to_devlink(pf), devlink);
+	if (err) {
+		devlink_free(devlink);
+		return ERR_PTR(err);
+	}
 
 	return devlink_priv(devlink);
 }
@@ -1466,6 +1746,7 @@ void ice_devlink_unregister(struct ice_pf *pf)
 int ice_devlink_register_params(struct ice_pf *pf)
 {
 	struct devlink *devlink = priv_to_devlink(pf);
+	union devlink_param_value value;
 	struct ice_hw *hw = &pf->hw;
 	int status;
 
@@ -1474,10 +1755,39 @@ int ice_devlink_register_params(struct ice_pf *pf)
 	if (status)
 		return status;
 
+	status = devl_params_register(devlink, ice_dvl_msix_params,
+				      ARRAY_SIZE(ice_dvl_msix_params));
+	if (status)
+		goto unregister_rdma_params;
+
 	if (hw->func_caps.common_cap.tx_sched_topo_comp_mode_en)
 		status = devl_params_register(devlink, ice_dvl_sched_params,
 					      ARRAY_SIZE(ice_dvl_sched_params));
+	if (status)
+		goto unregister_msix_params;
 
+	value.vu32 = pf->msix.max;
+	devl_param_driverinit_value_set(devlink,
+					DEVLINK_PARAM_GENERIC_ID_MSIX_VEC_PER_PF_MAX,
+					value);
+	value.vu32 = pf->msix.min;
+	devl_param_driverinit_value_set(devlink,
+					DEVLINK_PARAM_GENERIC_ID_MSIX_VEC_PER_PF_MIN,
+					value);
+
+	value.vbool = test_bit(ICE_FLAG_RDMA_ENA, pf->flags);
+	devl_param_driverinit_value_set(devlink,
+					DEVLINK_PARAM_GENERIC_ID_ENABLE_RDMA,
+					value);
+
+	return 0;
+
+unregister_msix_params:
+	devl_params_unregister(devlink, ice_dvl_msix_params,
+			       ARRAY_SIZE(ice_dvl_msix_params));
+unregister_rdma_params:
+	devl_params_unregister(devlink, ice_dvl_rdma_params,
+			       ARRAY_SIZE(ice_dvl_rdma_params));
 	return status;
 }
 
@@ -1488,6 +1798,8 @@ void ice_devlink_unregister_params(struct ice_pf *pf)
 
 	devl_params_unregister(devlink, ice_dvl_rdma_params,
 			       ARRAY_SIZE(ice_dvl_rdma_params));
+	devl_params_unregister(devlink, ice_dvl_msix_params,
+			       ARRAY_SIZE(ice_dvl_msix_params));
 
 	if (hw->func_caps.common_cap.tx_sched_topo_comp_mode_en)
 		devl_params_unregister(devlink, ice_dvl_sched_params,

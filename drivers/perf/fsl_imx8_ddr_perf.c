@@ -846,8 +846,9 @@ static struct platform_driver imx_ddr_pmu_driver = {
 		.suppress_bind_attrs = true,
 	},
 	.probe          = ddr_perf_probe,
-	.remove_new     = ddr_perf_remove,
+	.remove         = ddr_perf_remove,
 };
 
 module_platform_driver(imx_ddr_pmu_driver);
+MODULE_DESCRIPTION("Freescale i.MX8 DDR Performance Monitor Driver");
 MODULE_LICENSE("GPL v2");

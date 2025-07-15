@@ -35,6 +35,7 @@ Security-related interfaces
    mfd_noexec
    spec_ctrl
    tee
+   check_exec
 
 Devices and I/O
 ===============
@@ -43,9 +44,10 @@ Devices and I/O
    :maxdepth: 1
 
    accelerators/ocxl
+   dma-buf-heaps
    dma-buf-alloc-exchange
+   fwctl/index
    gpio/index
-   iommu
    iommufd
    media/index
    dcdbas
@@ -64,6 +66,7 @@ Everything else
    vduse
    futex2
    perf_ring_buffer
+   ntsync
 
 .. only::  subproject and html
 

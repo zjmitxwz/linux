@@ -1144,7 +1144,7 @@ int mhi_prepare_for_power_up(struct mhi_controller *mhi_cntrl)
 	}
 	mhi_cntrl->bhi = mhi_cntrl->regs + bhi_off;
 
-	if (mhi_cntrl->fbc_download || mhi_cntrl->rddm_size) {
+	if (mhi_cntrl->fbc_download || mhi_cntrl->rddm_size || mhi_cntrl->seg_len) {
 		ret = mhi_read_reg(mhi_cntrl, mhi_cntrl->regs, BHIEOFF,
 				   &bhie_off);
 		if (ret) {
@@ -1442,10 +1442,10 @@ static int mhi_uevent(const struct device *dev, struct kobj_uevent_env *env)
 					mhi_dev->name);
 }
 
-static int mhi_match(struct device *dev, struct device_driver *drv)
+static int mhi_match(struct device *dev, const struct device_driver *drv)
 {
 	struct mhi_device *mhi_dev = to_mhi_device(dev);
-	struct mhi_driver *mhi_drv = to_mhi_driver(drv);
+	const struct mhi_driver *mhi_drv = to_mhi_driver(drv);
 	const struct mhi_device_id *id;
 
 	/*
@@ -1464,7 +1464,7 @@ static int mhi_match(struct device *dev, struct device_driver *drv)
 	return 0;
 };
 
-struct bus_type mhi_bus_type = {
+const struct bus_type mhi_bus_type = {
 	.name = "mhi",
 	.dev_name = "mhi",
 	.match = mhi_match,

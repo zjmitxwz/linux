@@ -1,6 +1,5 @@
+// SPDX-License-Identifier: MIT
 /*
- * SPDX-License-Identifier: MIT
- *
  * Copyright © 2008,2010 Intel Corporation
  */
 
@@ -11,8 +10,6 @@
 
 #include <drm/drm_auth.h>
 #include <drm/drm_syncobj.h>
-
-#include "display/intel_frontbuffer.h"
 
 #include "gem/i915_gem_ioctls.h"
 #include "gt/intel_context.h"
@@ -305,7 +302,7 @@ struct i915_execbuffer {
 	struct intel_gt_buffer_pool_node *batch_pool; /** pool node for batch buffer */
 
 	/**
-	 * Indicate either the size of the hastable used to resolve
+	 * Indicate either the size of the hashtable used to resolve
 	 * relocation handles, or if negative that we are using a direct
 	 * index into the execobj[].
 	 */
@@ -340,7 +337,7 @@ static int eb_create(struct i915_execbuffer *eb)
 		 * Without a 1:1 association between relocation handles and
 		 * the execobject[] index, we instead create a hashtable.
 		 * We size it dynamically based on available memory, starting
-		 * first with 1:1 assocative hash and scaling back until
+		 * first with 1:1 associative hash and scaling back until
 		 * the allocation succeeds.
 		 *
 		 * Later on we use a positive lut_size to indicate we are
@@ -827,7 +824,7 @@ static int eb_select_context(struct i915_execbuffer *eb)
 	struct i915_gem_context *ctx;
 
 	ctx = i915_gem_context_lookup(eb->file->driver_priv, eb->args->rsvd1);
-	if (unlikely(IS_ERR(ctx)))
+	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
 
 	eb->gem_context = ctx;
@@ -917,7 +914,7 @@ static struct i915_vma *eb_lookup_vma(struct i915_execbuffer *eb, u32 handle)
 		 */
 		if (i915_gem_context_uses_protected_content(eb->gem_context) &&
 		    i915_gem_object_is_protected(obj)) {
-			err = intel_pxp_key_check(eb->i915->pxp, obj, true);
+			err = intel_pxp_key_check(intel_bo_to_drm_bo(obj), true);
 			if (err) {
 				i915_gem_object_put(obj);
 				return ERR_PTR(err);
@@ -1533,7 +1530,7 @@ static int eb_relocate_vma(struct i915_execbuffer *eb, struct eb_vma *ev)
 		u64_to_user_ptr(entry->relocs_ptr);
 	unsigned long remain = entry->relocation_count;
 
-	if (unlikely(remain > N_RELOC(ULONG_MAX)))
+	if (unlikely(remain > N_RELOC(INT_MAX)))
 		return -EINVAL;
 
 	/*
@@ -1641,7 +1638,7 @@ static int check_relocations(const struct drm_i915_gem_exec_object2 *entry)
 	if (size == 0)
 		return 0;
 
-	if (size > N_RELOC(ULONG_MAX))
+	if (size > N_RELOC(INT_MAX))
 		return -EINVAL;
 
 	addr = u64_to_user_ptr(entry->relocs_ptr);
@@ -2545,7 +2542,7 @@ static int eb_pin_timeline(struct i915_execbuffer *eb, struct intel_context *ce,
 
 			/*
 			 * Error path, cannot use intel_context_timeline_lock as
-			 * that is user interruptable and this clean up step
+			 * that is user interruptible and this clean up step
 			 * must be done.
 			 */
 			mutex_lock(&ce->timeline->mutex);

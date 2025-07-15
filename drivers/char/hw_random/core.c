@@ -161,7 +161,6 @@ static int hwrng_init(struct hwrng *rng)
 	reinit_completion(&rng->cleanup_done);
 
 skip_init:
-	rng->quality = min_t(u16, min_t(u16, default_quality, 1024), rng->quality ?: 1024);
 	current_quality = rng->quality; /* obsolete */
 
 	return 0;
@@ -182,8 +181,15 @@ static inline int rng_get_data(struct hwrng *rng, u8 *buffer, size_t size,
 	int present;
 
 	BUG_ON(!mutex_is_locked(&reading_mutex));
-	if (rng->read)
-		return rng->read(rng, (void *)buffer, size, wait);
+	if (rng->read) {
+		int err;
+
+		err = rng->read(rng, buffer, size, wait);
+		if (WARN_ON_ONCE(err > 0 && err > size))
+			err = size;
+
+		return err;
+	}
 
 	if (rng->data_present)
 		present = rng->data_present(rng, wait);
@@ -470,16 +476,6 @@ static struct attribute *rng_dev_attrs[] = {
 
 ATTRIBUTE_GROUPS(rng_dev);
 
-static void __exit unregister_miscdev(void)
-{
-	misc_deregister(&rng_miscdev);
-}
-
-static int __init register_miscdev(void)
-{
-	return misc_register(&rng_miscdev);
-}
-
 static int hwrng_fillfn(void *unused)
 {
 	size_t entropy, entropy_credit = 0; /* in 1/1024 of a bit */
@@ -544,6 +540,9 @@ int hwrng_register(struct hwrng *rng)
 	init_completion(&rng->cleanup_done);
 	complete(&rng->cleanup_done);
 	init_completion(&rng->dying);
+
+	/* Adjust quality field to always have a proper value */
+	rng->quality = min_t(u16, min_t(u16, default_quality, 1024), rng->quality ?: 1024);
 
 	if (!current_rng ||
 	    (!cur_rng_set_by_user && rng->quality > current_rng->quality)) {
@@ -668,7 +667,7 @@ static int __init hwrng_modinit(void)
 		return -ENOMEM;
 	}
 
-	ret = register_miscdev();
+	ret = misc_register(&rng_miscdev);
 	if (ret) {
 		kfree(rng_fillbuf);
 		kfree(rng_buffer);
@@ -685,7 +684,7 @@ static void __exit hwrng_modexit(void)
 	kfree(rng_fillbuf);
 	mutex_unlock(&rng_mutex);
 
-	unregister_miscdev();
+	misc_deregister(&rng_miscdev);
 }
 
 fs_initcall(hwrng_modinit); /* depends on misc_register() */

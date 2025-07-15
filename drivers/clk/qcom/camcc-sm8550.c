@@ -3487,7 +3487,7 @@ static const struct regmap_config cam_cc_sm8550_regmap_config = {
 	.fast_io = true,
 };
 
-static struct qcom_cc_desc cam_cc_sm8550_desc = {
+static const struct qcom_cc_desc cam_cc_sm8550_desc = {
 	.config = &cam_cc_sm8550_regmap_config,
 	.clks = cam_cc_sm8550_clocks,
 	.num_clks = ARRAY_SIZE(cam_cc_sm8550_clocks),
@@ -3540,7 +3540,7 @@ static int cam_cc_sm8550_probe(struct platform_device *pdev)
 	qcom_branch_set_clk_en(regmap, 0x1419c); /* CAM_CC_GDSC_CLK */
 	qcom_branch_set_clk_en(regmap, 0x142cc); /* CAM_CC_SLEEP_CLK */
 
-	ret = qcom_cc_really_probe(pdev, &cam_cc_sm8550_desc, regmap);
+	ret = qcom_cc_really_probe(&pdev->dev, &cam_cc_sm8550_desc, regmap);
 
 	pm_runtime_put(&pdev->dev);
 

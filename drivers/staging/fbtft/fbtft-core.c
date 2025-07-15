@@ -152,7 +152,7 @@ static int fbtft_backlight_get_brightness(struct backlight_device *bd)
 void fbtft_unregister_backlight(struct fbtft_par *par)
 {
 	if (par->info->bl_dev) {
-		par->info->bl_dev->props.power = FB_BLANK_POWERDOWN;
+		par->info->bl_dev->props.power = BACKLIGHT_POWER_OFF;
 		backlight_update_status(par->info->bl_dev);
 		backlight_device_unregister(par->info->bl_dev);
 		par->info->bl_dev = NULL;
@@ -178,7 +178,7 @@ void fbtft_register_backlight(struct fbtft_par *par)
 
 	bl_props.type = BACKLIGHT_RAW;
 	/* Assume backlight is off, get polarity from current state of pin */
-	bl_props.power = FB_BLANK_POWERDOWN;
+	bl_props.power = BACKLIGHT_POWER_OFF;
 	if (!gpiod_get_value(par->gpio.led[0]))
 		par->polarity = true;
 
@@ -214,8 +214,6 @@ static void fbtft_reset(struct fbtft_par *par)
 {
 	if (!par->gpio.reset)
 		return;
-
-	fbtft_par_dbg(DEBUG_RESET, par, "%s()\n", __func__);
 
 	gpiod_set_value_cansleep(par->gpio.reset, 1);
 	usleep_range(20, 40);
@@ -339,9 +337,7 @@ static void fbtft_deferred_io(struct fb_info *info, struct list_head *pagereflis
 	list_for_each_entry(pageref, pagereflist, list) {
 		y_low = pageref->offset / info->fix.line_length;
 		y_high = (pageref->offset + PAGE_SIZE - 1) / info->fix.line_length;
-		dev_dbg(info->device,
-			"page->index=%lu y_low=%d y_high=%d\n",
-			pageref->page->index, y_low, y_high);
+		dev_dbg(info->device, "y_low=%d y_high=%d\n", y_low, y_high);
 		if (y_high > info->var.yres - 1)
 			y_high = info->var.yres - 1;
 		if (y_low < dirty_lines_start)
@@ -801,7 +797,7 @@ int fbtft_register_framebuffer(struct fb_info *fb_info)
 
 	/* Turn on backlight if available */
 	if (fb_info->bl_dev) {
-		fb_info->bl_dev->props.power = FB_BLANK_UNBLANK;
+		fb_info->bl_dev->props.power = BACKLIGHT_POWER_ON;
 		fb_info->bl_dev->ops->update_status(fb_info->bl_dev);
 	}
 
@@ -1052,8 +1048,6 @@ static int fbtft_verify_gpios(struct fbtft_par *par)
 	struct fbtft_platform_data *pdata = par->pdata;
 	int i;
 
-	fbtft_par_dbg(DEBUG_VERIFY_GPIOS, par, "%s()\n", __func__);
-
 	if (pdata->display.buswidth != 9 &&  par->startbyte == 0 &&
 	    !par->gpio.dc) {
 		dev_err(par->info->device,
@@ -1156,9 +1150,6 @@ int fbtft_probe_common(struct fbtft_display *display,
 		dev = &sdev->dev;
 	else
 		dev = &pdev->dev;
-
-	if (unlikely(display->debug & DEBUG_DRIVER_INIT_FUNCTIONS))
-		dev_info(dev, "%s()\n", __func__);
 
 	pdata = dev->platform_data;
 	if (!pdata) {
@@ -1276,4 +1267,5 @@ void fbtft_remove_common(struct device *dev, struct fb_info *info)
 }
 EXPORT_SYMBOL(fbtft_remove_common);
 
+MODULE_DESCRIPTION("Core FB support for small TFT LCD display modules");
 MODULE_LICENSE("GPL");

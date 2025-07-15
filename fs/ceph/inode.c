@@ -160,7 +160,7 @@ struct inode *ceph_get_inode(struct super_block *sb, struct ceph_vino vino,
 }
 
 /*
- * get/constuct snapdir inode for a given directory
+ * get/construct snapdir inode for a given directory
  */
 struct inode *ceph_get_snapdir(struct inode *parent)
 {
@@ -577,8 +577,6 @@ struct inode *ceph_alloc_inode(struct super_block *sb)
 
 	/* Set parameters for the netfs library */
 	netfs_inode_init(&ci->netfs, &ceph_netfs_ops, false);
-	/* [DEPRECATED] Use PG_private_2 to mark folio being written to the cache. */
-	__set_bit(NETFS_ICTX_USE_PGPRIV2, &ci->netfs.flags);
 
 	spin_lock_init(&ci->i_ceph_lock);
 
@@ -697,6 +695,7 @@ void ceph_evict_inode(struct inode *inode)
 
 	percpu_counter_dec(&mdsc->metric.total_inodes);
 
+	netfs_wait_for_outstanding_io(inode);
 	truncate_inode_pages_final(&inode->i_data);
 	if (inode->i_state & I_PINNING_NETFS_WB)
 		ceph_fscache_unuse_cookie(inode, true);
@@ -1780,7 +1779,7 @@ retry_lookup:
 		if (err < 0)
 			goto done;
 	} else if (rinfo->head->is_dentry && req->r_dentry) {
-		/* parent inode is not locked, be carefull */
+		/* parent inode is not locked, be careful */
 		struct ceph_vino *ptvino = NULL;
 		dvino.ino = le64_to_cpu(rinfo->diri.in->ino);
 		dvino.snap = le64_to_cpu(rinfo->diri.in->snapid);
@@ -1846,10 +1845,9 @@ static int readdir_prepopulate_inodes_only(struct ceph_mds_request *req,
 
 void ceph_readdir_cache_release(struct ceph_readdir_cache_control *ctl)
 {
-	if (ctl->page) {
-		kunmap(ctl->page);
-		put_page(ctl->page);
-		ctl->page = NULL;
+	if (ctl->folio) {
+		folio_release_kmap(ctl->folio, ctl->dentries);
+		ctl->folio = NULL;
 	}
 }
 
@@ -1863,20 +1861,26 @@ static int fill_readdir_cache(struct inode *dir, struct dentry *dn,
 	unsigned idx = ctl->index % nsize;
 	pgoff_t pgoff = ctl->index / nsize;
 
-	if (!ctl->page || pgoff != page_index(ctl->page)) {
+	if (!ctl->folio || pgoff != ctl->folio->index) {
 		ceph_readdir_cache_release(ctl);
+		fgf_t fgf = FGP_LOCK;
+
 		if (idx == 0)
-			ctl->page = grab_cache_page(&dir->i_data, pgoff);
-		else
-			ctl->page = find_lock_page(&dir->i_data, pgoff);
-		if (!ctl->page) {
+			fgf |= FGP_ACCESSED | FGP_CREAT;
+
+		ctl->folio = __filemap_get_folio(&dir->i_data, pgoff,
+				fgf, mapping_gfp_mask(&dir->i_data));
+		if (IS_ERR(ctl->folio)) {
+			int err = PTR_ERR(ctl->folio);
+
+			ctl->folio = NULL;
 			ctl->index = -1;
-			return idx == 0 ? -ENOMEM : 0;
+			return idx == 0 ? err : 0;
 		}
 		/* reading/filling the cache are serialized by
-		 * i_rwsem, no need to use page lock */
-		unlock_page(ctl->page);
-		ctl->dentries = kmap(ctl->page);
+		 * i_rwsem, no need to use folio lock */
+		folio_unlock(ctl->folio);
+		ctl->dentries = kmap_local_folio(ctl->folio, 0);
 		if (idx == 0)
 			memset(ctl->dentries, 0, PAGE_SIZE);
 	}
@@ -2363,7 +2367,7 @@ static int fill_fscrypt_truncate(struct inode *inode,
 
 	/* Try to writeback the dirty pagecaches */
 	if (issued & (CEPH_CAP_FILE_BUFFER)) {
-		loff_t lend = orig_pos + CEPH_FSCRYPT_BLOCK_SHIFT - 1;
+		loff_t lend = orig_pos + CEPH_FSCRYPT_BLOCK_SIZE - 1;
 
 		ret = filemap_write_and_wait_range(inode->i_mapping,
 						   orig_pos, lend);

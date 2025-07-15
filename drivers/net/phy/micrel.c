@@ -34,6 +34,8 @@
 #include <linux/net_tstamp.h>
 #include <linux/gpio/consumer.h>
 
+#include "phylib.h"
+
 /* Operation Mode Strap Override */
 #define MII_KSZPHY_OMSO				0x16
 #define KSZPHY_OMSO_FACTORY_TEST		BIT(15)
@@ -432,10 +434,12 @@ struct kszphy_ptp_priv {
 struct kszphy_priv {
 	struct kszphy_ptp_priv ptp_priv;
 	const struct kszphy_type *type;
+	struct clk *clk;
 	int led_mode;
 	u16 vct_ctrl1000;
 	bool rmii_ref_clk_sel;
 	bool rmii_ref_clk_sel_val;
+	bool clk_enable;
 	u64 stats[ARRAY_SIZE(kszphy_hw_stats)];
 };
 
@@ -764,7 +768,8 @@ static int ksz8051_ksz8795_match_phy_device(struct phy_device *phydev,
 		return !ret;
 }
 
-static int ksz8051_match_phy_device(struct phy_device *phydev)
+static int ksz8051_match_phy_device(struct phy_device *phydev,
+				    const struct phy_driver *phydrv)
 {
 	return ksz8051_ksz8795_match_phy_device(phydev, true);
 }
@@ -884,7 +889,8 @@ static int ksz8061_config_init(struct phy_device *phydev)
 	return kszphy_config_init(phydev);
 }
 
-static int ksz8795_match_phy_device(struct phy_device *phydev)
+static int ksz8795_match_phy_device(struct phy_device *phydev,
+				    const struct phy_driver *phydrv)
 {
 	return ksz8051_ksz8795_match_phy_device(phydev, false);
 }
@@ -1027,6 +1033,29 @@ static int ksz9021_config_init(struct phy_device *phydev)
 /* MMD Address 0x1C */
 #define MII_KSZ9031RN_EDPD		0x23
 #define MII_KSZ9031RN_EDPD_ENABLE	BIT(0)
+
+static int ksz9031_set_loopback(struct phy_device *phydev, bool enable,
+				int speed)
+{
+	u16 ctl = BMCR_LOOPBACK;
+	int val;
+
+	if (!enable)
+		return genphy_loopback(phydev, enable, 0);
+
+	if (speed == SPEED_10 || speed == SPEED_100 || speed == SPEED_1000)
+		phydev->speed = speed;
+	else if (speed)
+		return -EINVAL;
+	phydev->duplex = DUPLEX_FULL;
+
+	ctl |= mii_bmcr_encode_fixed(phydev->speed, phydev->duplex);
+
+	phy_write(phydev, MII_BMCR, ctl);
+
+	return phy_read_poll_timeout(phydev, MII_BMSR, val, val & BMSR_LSTATUS,
+				     5000, 500000, true);
+}
 
 static int ksz9031_of_load_skew_values(struct phy_device *phydev,
 				       const struct device_node *of_node,
@@ -1389,6 +1418,8 @@ static int ksz9131_config_init(struct phy_device *phydev)
 	const struct device *dev_walker;
 	int ret;
 
+	phydev->mdix_ctrl = ETH_TP_MDI_AUTO;
+
 	dev_walker = &phydev->mdio.dev;
 	do {
 		of_node = dev_walker->of_node;
@@ -1438,28 +1469,30 @@ static int ksz9131_config_init(struct phy_device *phydev)
 #define MII_KSZ9131_AUTO_MDIX		0x1C
 #define MII_KSZ9131_AUTO_MDI_SET	BIT(7)
 #define MII_KSZ9131_AUTO_MDIX_SWAP_OFF	BIT(6)
+#define MII_KSZ9131_DIG_AXAN_STS	0x14
+#define MII_KSZ9131_DIG_AXAN_STS_LINK_DET	BIT(14)
+#define MII_KSZ9131_DIG_AXAN_STS_A_SELECT	BIT(12)
 
 static int ksz9131_mdix_update(struct phy_device *phydev)
 {
 	int ret;
 
-	ret = phy_read(phydev, MII_KSZ9131_AUTO_MDIX);
-	if (ret < 0)
-		return ret;
-
-	if (ret & MII_KSZ9131_AUTO_MDIX_SWAP_OFF) {
-		if (ret & MII_KSZ9131_AUTO_MDI_SET)
-			phydev->mdix_ctrl = ETH_TP_MDI;
-		else
-			phydev->mdix_ctrl = ETH_TP_MDI_X;
+	if (phydev->mdix_ctrl != ETH_TP_MDI_AUTO) {
+		phydev->mdix = phydev->mdix_ctrl;
 	} else {
-		phydev->mdix_ctrl = ETH_TP_MDI_AUTO;
-	}
+		ret = phy_read(phydev, MII_KSZ9131_DIG_AXAN_STS);
+		if (ret < 0)
+			return ret;
 
-	if (ret & MII_KSZ9131_AUTO_MDI_SET)
-		phydev->mdix = ETH_TP_MDI;
-	else
-		phydev->mdix = ETH_TP_MDI_X;
+		if (ret & MII_KSZ9131_DIG_AXAN_STS_LINK_DET) {
+			if (ret & MII_KSZ9131_DIG_AXAN_STS_A_SELECT)
+				phydev->mdix = ETH_TP_MDI;
+			else
+				phydev->mdix = ETH_TP_MDI_X;
+		} else {
+			phydev->mdix = ETH_TP_MDI_INVALID;
+		}
+	}
 
 	return 0;
 }
@@ -1996,12 +2029,6 @@ static int ksz9477_config_init(struct phy_device *phydev)
 			return err;
 	}
 
-	/* According to KSZ9477 Errata DS80000754C (Module 4) all EEE modes
-	 * in this switch shall be regarded as broken.
-	 */
-	if (phydev->dev_flags & MICREL_NO_EEE)
-		phydev->eee_broken_modes = -1;
-
 	return kszphy_config_init(phydev);
 }
 
@@ -2014,10 +2041,8 @@ static void kszphy_get_strings(struct phy_device *phydev, u8 *data)
 {
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(kszphy_hw_stats); i++) {
-		strscpy(data + i * ETH_GSTRING_LEN,
-			kszphy_hw_stats[i].string, ETH_GSTRING_LEN);
-	}
+	for (i = 0; i < ARRAY_SIZE(kszphy_hw_stats); i++)
+		ethtool_puts(&data, kszphy_hw_stats[i].string);
 }
 
 static u64 kszphy_get_stat(struct phy_device *phydev, int i)
@@ -2048,6 +2073,46 @@ static void kszphy_get_stats(struct phy_device *phydev,
 		data[i] = kszphy_get_stat(phydev, i);
 }
 
+static void kszphy_enable_clk(struct phy_device *phydev)
+{
+	struct kszphy_priv *priv = phydev->priv;
+
+	if (!priv->clk_enable && priv->clk) {
+		clk_prepare_enable(priv->clk);
+		priv->clk_enable = true;
+	}
+}
+
+static void kszphy_disable_clk(struct phy_device *phydev)
+{
+	struct kszphy_priv *priv = phydev->priv;
+
+	if (priv->clk_enable && priv->clk) {
+		clk_disable_unprepare(priv->clk);
+		priv->clk_enable = false;
+	}
+}
+
+static int kszphy_generic_resume(struct phy_device *phydev)
+{
+	kszphy_enable_clk(phydev);
+
+	return genphy_resume(phydev);
+}
+
+static int kszphy_generic_suspend(struct phy_device *phydev)
+{
+	int ret;
+
+	ret = genphy_suspend(phydev);
+	if (ret)
+		return ret;
+
+	kszphy_disable_clk(phydev);
+
+	return 0;
+}
+
 static int kszphy_suspend(struct phy_device *phydev)
 {
 	/* Disable PHY Interrupts */
@@ -2057,7 +2122,7 @@ static int kszphy_suspend(struct phy_device *phydev)
 			phydev->drv->config_intr(phydev);
 	}
 
-	return genphy_suspend(phydev);
+	return kszphy_generic_suspend(phydev);
 }
 
 static void kszphy_parse_led_mode(struct phy_device *phydev)
@@ -2088,7 +2153,9 @@ static int kszphy_resume(struct phy_device *phydev)
 {
 	int ret;
 
-	genphy_resume(phydev);
+	ret = kszphy_generic_resume(phydev);
+	if (ret)
+		return ret;
 
 	/* After switching from power-down to normal mode, an internal global
 	 * reset is automatically generated. Wait a minimum of 1 ms before
@@ -2106,6 +2173,24 @@ static int kszphy_resume(struct phy_device *phydev)
 		if (phydev->drv->config_intr)
 			phydev->drv->config_intr(phydev);
 	}
+
+	return 0;
+}
+
+/* Because of errata DS80000700A, receiver error following software
+ * power down. Suspend and resume callbacks only disable and enable
+ * external rmii reference clock.
+ */
+static int ksz8041_resume(struct phy_device *phydev)
+{
+	kszphy_enable_clk(phydev);
+
+	return 0;
+}
+
+static int ksz8041_suspend(struct phy_device *phydev)
+{
+	kszphy_disable_clk(phydev);
 
 	return 0;
 }
@@ -2157,7 +2242,10 @@ static int ksz8061_resume(struct phy_device *phydev)
 	if (!(ret & BMCR_PDOWN))
 		return 0;
 
-	genphy_resume(phydev);
+	ret = kszphy_generic_resume(phydev);
+	if (ret)
+		return ret;
+
 	usleep_range(1000, 2000);
 
 	/* Re-program the value after chip is reset. */
@@ -2173,6 +2261,11 @@ static int ksz8061_resume(struct phy_device *phydev)
 	}
 
 	return 0;
+}
+
+static int ksz8061_suspend(struct phy_device *phydev)
+{
+	return kszphy_suspend(phydev);
 }
 
 static int kszphy_probe(struct phy_device *phydev)
@@ -2215,9 +2308,13 @@ static int kszphy_probe(struct phy_device *phydev)
 	} else if (!clk) {
 		/* unnamed clock from the generic ethernet-phy binding */
 		clk = devm_clk_get_optional_enabled(&phydev->mdio.dev, NULL);
-		if (IS_ERR(clk))
-			return PTR_ERR(clk);
 	}
+
+	if (IS_ERR(clk))
+		return PTR_ERR(clk);
+
+	clk_disable_unprepare(clk);
+	priv->clk = clk;
 
 	if (ksz8041_fiber_mode(phydev))
 		phydev->port = PORT_FIBRE;
@@ -2552,11 +2649,10 @@ static void lan8814_ptp_tx_ts_get(struct phy_device *phydev,
 	*seq_id = lanphy_read_page_reg(phydev, 5, PTP_TX_MSG_HEADER2);
 }
 
-static int lan8814_ts_info(struct mii_timestamper *mii_ts, struct ethtool_ts_info *info)
+static int lan8814_ts_info(struct mii_timestamper *mii_ts, struct kernel_ethtool_ts_info *info)
 {
 	struct kszphy_ptp_priv *ptp_priv = container_of(mii_ts, struct kszphy_ptp_priv, mii_ts);
-	struct phy_device *phydev = ptp_priv->phydev;
-	struct lan8814_shared_priv *shared = phydev->shared->priv;
+	struct lan8814_shared_priv *shared = phy_package_get_priv(ptp_priv->phydev);
 
 	info->so_timestamping = SOF_TIMESTAMPING_TX_HARDWARE |
 				SOF_TIMESTAMPING_RX_HARDWARE |
@@ -3136,10 +3232,6 @@ static int lan8814_ptp_perout(struct ptp_clock_info *ptpci,
 	int pulse_width;
 	int pin, event;
 
-	/* Reject requests with unsupported flags */
-	if (rq->perout.flags & ~PTP_PEROUT_DUTY_CYCLE)
-		return -EOPNOTSUPP;
-
 	mutex_lock(&shared->shared_lock);
 	event = rq->perout.index;
 	pin = ptp_find_pin(shared->ptp_clock, PTP_PF_PEROUT, event);
@@ -3305,11 +3397,6 @@ static int lan8814_ptp_extts(struct ptp_clock_info *ptpci,
 							  ptp_clock_info);
 	struct phy_device *phydev = shared->phydev;
 	int pin;
-
-	if (rq->extts.flags & ~(PTP_ENABLE_FEATURE |
-				PTP_EXTTS_EDGES |
-				PTP_STRICT_FLAGS))
-		return -EOPNOTSUPP;
 
 	pin = ptp_find_pin(shared->ptp_clock, PTP_PF_EXTTS,
 			   rq->extts.index);
@@ -3577,7 +3664,7 @@ static int lan8814_gpio_process_cap(struct lan8814_shared_priv *shared)
 
 static int lan8814_handle_gpio_interrupt(struct phy_device *phydev, u16 status)
 {
-	struct lan8814_shared_priv *shared = phydev->shared->priv;
+	struct lan8814_shared_priv *shared = phy_package_get_priv(phydev);
 	int ret;
 
 	mutex_lock(&shared->shared_lock);
@@ -3781,11 +3868,14 @@ static void lan8814_ptp_init(struct phy_device *phydev)
 	ptp_priv->mii_ts.ts_info  = lan8814_ts_info;
 
 	phydev->mii_ts = &ptp_priv->mii_ts;
+
+	/* Timestamp selected by default to keep legacy API */
+	phydev->default_timestamp = true;
 }
 
 static int lan8814_ptp_probe_once(struct phy_device *phydev)
 {
-	struct lan8814_shared_priv *shared = phydev->shared->priv;
+	struct lan8814_shared_priv *shared = phy_package_get_priv(phydev);
 
 	/* Initialise shared lock for clock*/
 	mutex_init(&shared->shared_lock);
@@ -3814,6 +3904,10 @@ static int lan8814_ptp_probe_once(struct phy_device *phydev)
 	shared->ptp_clock_info.n_ext_ts = LAN8814_PTP_EXTTS_NUM;
 	shared->ptp_clock_info.n_pins = LAN8814_PTP_GPIO_NUM;
 	shared->ptp_clock_info.pps = 0;
+	shared->ptp_clock_info.supported_extts_flags = PTP_RISING_EDGE |
+						       PTP_FALLING_EDGE |
+						       PTP_STRICT_FLAGS;
+	shared->ptp_clock_info.supported_perout_flags = PTP_PEROUT_DUTY_CYCLE;
 	shared->ptp_clock_info.pin_config = shared->pin_config;
 	shared->ptp_clock_info.n_per_out = LAN8814_PTP_PEROUT_NUM;
 	shared->ptp_clock_info.adjfine = lan8814_ptpci_adjfine;
@@ -4314,7 +4408,7 @@ static irqreturn_t lan8841_handle_interrupt(struct phy_device *phydev)
 }
 
 static int lan8841_ts_info(struct mii_timestamper *mii_ts,
-			   struct ethtool_ts_info *info)
+			   struct kernel_ethtool_ts_info *info)
 {
 	struct kszphy_ptp_priv *ptp_priv;
 
@@ -4965,9 +5059,6 @@ static int lan8841_ptp_perout(struct ptp_clock_info *ptp,
 	int pin;
 	int ret;
 
-	if (rq->perout.flags & ~PTP_PEROUT_DUTY_CYCLE)
-		return -EOPNOTSUPP;
-
 	pin = ptp_find_pin(ptp_priv->ptp_clock, PTP_PF_PEROUT, rq->perout.index);
 	if (pin == -1 || pin >= LAN8841_PTP_GPIO_NUM)
 		return -EINVAL;
@@ -5211,6 +5302,7 @@ static struct ptp_clock_info lan8841_ptp_clock_info = {
 	.n_per_out      = LAN8841_PTP_GPIO_NUM,
 	.n_ext_ts       = LAN8841_PTP_GPIO_NUM,
 	.n_pins         = LAN8841_PTP_GPIO_NUM,
+	.supported_perout_flags = PTP_PEROUT_DUTY_CYCLE,
 };
 
 #define LAN8841_OPERATION_MODE_STRAP_LOW_REGISTER 3
@@ -5279,7 +5371,25 @@ static int lan8841_probe(struct phy_device *phydev)
 
 	phydev->mii_ts = &ptp_priv->mii_ts;
 
+	/* Timestamp selected by default to keep legacy API */
+	phydev->default_timestamp = true;
+
 	return 0;
+}
+
+static int lan8804_resume(struct phy_device *phydev)
+{
+	return kszphy_resume(phydev);
+}
+
+static int lan8804_suspend(struct phy_device *phydev)
+{
+	return kszphy_generic_suspend(phydev);
+}
+
+static int lan8841_resume(struct phy_device *phydev)
+{
+	return kszphy_generic_resume(phydev);
 }
 
 static int lan8841_suspend(struct phy_device *phydev)
@@ -5290,7 +5400,7 @@ static int lan8841_suspend(struct phy_device *phydev)
 	if (ptp_priv->ptp_clock)
 		ptp_cancel_worker_sync(ptp_priv->ptp_clock);
 
-	return genphy_suspend(phydev);
+	return kszphy_generic_suspend(phydev);
 }
 
 static struct phy_driver ksphy_driver[] = {
@@ -5350,9 +5460,8 @@ static struct phy_driver ksphy_driver[] = {
 	.get_sset_count = kszphy_get_sset_count,
 	.get_strings	= kszphy_get_strings,
 	.get_stats	= kszphy_get_stats,
-	/* No suspend/resume callbacks because of errata DS80000700A,
-	 * receiver error following software power down.
-	 */
+	.suspend	= ksz8041_suspend,
+	.resume		= ksz8041_resume,
 }, {
 	.phy_id		= PHY_ID_KSZ8041RNLI,
 	.phy_id_mask	= MICREL_PHY_ID_MASK,
@@ -5428,7 +5537,7 @@ static struct phy_driver ksphy_driver[] = {
 	.soft_reset	= genphy_soft_reset,
 	.config_intr	= kszphy_config_intr,
 	.handle_interrupt = kszphy_handle_interrupt,
-	.suspend	= kszphy_suspend,
+	.suspend	= ksz8061_suspend,
 	.resume		= ksz8061_resume,
 }, {
 	.phy_id		= PHY_ID_KSZ9021,
@@ -5468,6 +5577,7 @@ static struct phy_driver ksphy_driver[] = {
 	.resume		= kszphy_resume,
 	.cable_test_start	= ksz9x31_cable_test_start,
 	.cable_test_get_status	= ksz9x31_cable_test_get_status,
+	.set_loopback	= ksz9031_set_loopback,
 }, {
 	.phy_id		= PHY_ID_LAN8814,
 	.phy_id_mask	= MICREL_PHY_ID_MASK,
@@ -5499,8 +5609,8 @@ static struct phy_driver ksphy_driver[] = {
 	.get_sset_count	= kszphy_get_sset_count,
 	.get_strings	= kszphy_get_strings,
 	.get_stats	= kszphy_get_stats,
-	.suspend	= genphy_suspend,
-	.resume		= kszphy_resume,
+	.suspend	= lan8804_suspend,
+	.resume		= lan8804_resume,
 	.config_intr	= lan8804_config_intr,
 	.handle_interrupt = lan8804_handle_interrupt,
 }, {
@@ -5518,7 +5628,7 @@ static struct phy_driver ksphy_driver[] = {
 	.get_strings	= kszphy_get_strings,
 	.get_stats	= kszphy_get_stats,
 	.suspend	= lan8841_suspend,
-	.resume		= genphy_resume,
+	.resume		= lan8841_resume,
 	.cable_test_start	= lan8814_cable_test_start,
 	.cable_test_get_status	= ksz886x_cable_test_get_status,
 }, {
@@ -5584,7 +5694,6 @@ static struct phy_driver ksphy_driver[] = {
 	.handle_interrupt = kszphy_handle_interrupt,
 	.suspend	= genphy_suspend,
 	.resume		= ksz9477_resume,
-	.get_features	= ksz9477_get_features,
 } };
 
 module_phy_driver(ksphy_driver);
@@ -5593,7 +5702,7 @@ MODULE_DESCRIPTION("Micrel PHY driver");
 MODULE_AUTHOR("David J. Choi");
 MODULE_LICENSE("GPL");
 
-static struct mdio_device_id __maybe_unused micrel_tbl[] = {
+static const struct mdio_device_id __maybe_unused micrel_tbl[] = {
 	{ PHY_ID_KSZ9021, 0x000ffffe },
 	{ PHY_ID_KSZ9031, MICREL_PHY_ID_MASK },
 	{ PHY_ID_KSZ9131, MICREL_PHY_ID_MASK },
@@ -5607,6 +5716,7 @@ static struct mdio_device_id __maybe_unused micrel_tbl[] = {
 	{ PHY_ID_KSZ8081, MICREL_PHY_ID_MASK },
 	{ PHY_ID_KSZ8873MLL, MICREL_PHY_ID_MASK },
 	{ PHY_ID_KSZ886X, MICREL_PHY_ID_MASK },
+	{ PHY_ID_KSZ9477, MICREL_PHY_ID_MASK },
 	{ PHY_ID_LAN8814, MICREL_PHY_ID_MASK },
 	{ PHY_ID_LAN8804, MICREL_PHY_ID_MASK },
 	{ PHY_ID_LAN8841, MICREL_PHY_ID_MASK },

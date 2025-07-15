@@ -26,6 +26,7 @@
 #include <linux/notifier.h>
 #include <linux/kthread.h>
 #include <linux/mutex.h>
+#include <asm/machine.h>
 #include <asm/airq.h>
 #include <asm/tpi.h>
 #include <linux/atomic.h>
@@ -40,6 +41,7 @@
 #include <linux/module.h>
 #include <asm/uv.h>
 #include <asm/chsc.h>
+#include <linux/mempool.h>
 
 #include "ap_bus.h"
 #include "ap_debug.h"
@@ -102,11 +104,33 @@ static struct ap_config_info *const ap_qci_info_old = &qci[1];
 debug_info_t *ap_dbf_info;
 
 /*
+ * There is a need for a do-not-allocate-memory path through the AP bus
+ * layer. The pkey layer may be triggered via the in-kernel interface from
+ * a protected key crypto algorithm (namely PAES) to convert a secure key
+ * into a protected key. This happens in a workqueue context, so sleeping
+ * is allowed but memory allocations causing IO operations are not permitted.
+ * To accomplish this, an AP message memory pool with pre-allocated space
+ * is established. When ap_init_apmsg() with use_mempool set to true is
+ * called, instead of kmalloc() the ap message buffer is allocated from
+ * the ap_msg_pool. This pool only holds a limited amount of buffers:
+ * ap_msg_pool_min_items with the item size AP_DEFAULT_MAX_MSG_SIZE and
+ * exactly one of these items (if available) is returned if ap_init_apmsg()
+ * with the use_mempool arg set to true is called. When this pool is exhausted
+ * and use_mempool is set true, ap_init_apmsg() returns -ENOMEM without
+ * any attempt to allocate memory and the caller has to deal with that.
+ */
+static mempool_t *ap_msg_pool;
+static unsigned int ap_msg_pool_min_items = 8;
+module_param_named(msgpool_min_items, ap_msg_pool_min_items, uint, 0440);
+MODULE_PARM_DESC(msgpool_min_items, "AP message pool minimal items");
+
+/*
  * AP bus rescan related things.
  */
 static bool ap_scan_bus(void);
 static bool ap_scan_bus_result; /* result of last ap_scan_bus() */
 static DEFINE_MUTEX(ap_scan_bus_mutex); /* mutex ap_scan_bus() invocations */
+static struct task_struct *ap_scan_bus_task; /* thread holding the scan mutex */
 static atomic64_t ap_scan_bus_count; /* counter ap_scan_bus() invocations */
 static int ap_scan_bus_time = AP_CONFIG_TIME;
 static struct timer_list ap_scan_bus_timer;
@@ -404,7 +428,7 @@ void ap_wait(enum ap_sm_wait wait)
  */
 void ap_request_timeout(struct timer_list *t)
 {
-	struct ap_queue *aq = from_timer(aq, t, timeout);
+	struct ap_queue *aq = timer_container_of(aq, t, timeout);
 
 	spin_lock_bh(&aq->lock);
 	ap_wait(ap_sm_event(aq, AP_SM_EVENT_TIMEOUT));
@@ -452,7 +476,7 @@ static void ap_tasklet_fn(unsigned long dummy)
 	 * important that no requests on any AP get lost.
 	 */
 	if (ap_irq_flag)
-		xchg(ap_airq.lsi_ptr, 0);
+		WRITE_ONCE(*ap_airq.lsi_ptr, 0);
 
 	spin_lock_bh(&ap_queues_lock);
 	hash_for_each(ap_queues, bkt, aq, hnode) {
@@ -545,6 +569,48 @@ static void ap_poll_thread_stop(void)
 #define is_card_dev(x) ((x)->parent == ap_root_device)
 #define is_queue_dev(x) ((x)->parent != ap_root_device)
 
+/*
+ * ap_init_apmsg() - Initialize ap_message.
+ */
+int ap_init_apmsg(struct ap_message *ap_msg, u32 flags)
+{
+	unsigned int maxmsgsize;
+
+	memset(ap_msg, 0, sizeof(*ap_msg));
+	ap_msg->flags = flags;
+
+	if (flags & AP_MSG_FLAG_MEMPOOL) {
+		ap_msg->msg = mempool_alloc_preallocated(ap_msg_pool);
+		if (!ap_msg->msg)
+			return -ENOMEM;
+		ap_msg->bufsize = AP_DEFAULT_MAX_MSG_SIZE;
+		return 0;
+	}
+
+	maxmsgsize = atomic_read(&ap_max_msg_size);
+	ap_msg->msg = kmalloc(maxmsgsize, GFP_KERNEL);
+	if (!ap_msg->msg)
+		return -ENOMEM;
+	ap_msg->bufsize = maxmsgsize;
+
+	return 0;
+}
+EXPORT_SYMBOL(ap_init_apmsg);
+
+/*
+ * ap_release_apmsg() - Release ap_message.
+ */
+void ap_release_apmsg(struct ap_message *ap_msg)
+{
+	if (ap_msg->flags & AP_MSG_FLAG_MEMPOOL) {
+		memzero_explicit(ap_msg->msg, ap_msg->bufsize);
+		mempool_free(ap_msg->msg, ap_msg_pool);
+	} else {
+		kfree_sensitive(ap_msg->msg);
+	}
+}
+EXPORT_SYMBOL(ap_release_apmsg);
+
 /**
  * ap_bus_match()
  * @dev: Pointer to device
@@ -552,9 +618,9 @@ static void ap_poll_thread_stop(void)
  *
  * AP bus driver registration/unregistration.
  */
-static int ap_bus_match(struct device *dev, struct device_driver *drv)
+static int ap_bus_match(struct device *dev, const struct device_driver *drv)
 {
-	struct ap_driver *ap_drv = to_ap_drv(drv);
+	const struct ap_driver *ap_drv = to_ap_drv(drv);
 	struct ap_device_id *id;
 
 	/*
@@ -733,7 +799,7 @@ static void ap_check_bindings_complete(void)
 			if (!completion_done(&ap_apqn_bindings_complete)) {
 				complete_all(&ap_apqn_bindings_complete);
 				ap_send_bindings_complete_uevent();
-				pr_debug("%s all apqn bindings complete\n", __func__);
+				pr_debug("all apqn bindings complete\n");
 			}
 		}
 	}
@@ -768,7 +834,7 @@ int ap_wait_apqn_bindings_complete(unsigned long timeout)
 	else if (l == 0 && timeout)
 		rc = -ETIME;
 
-	pr_debug("%s rc=%d\n", __func__, rc);
+	pr_debug("rc=%d\n", rc);
 	return rc;
 }
 EXPORT_SYMBOL(ap_wait_apqn_bindings_complete);
@@ -795,8 +861,7 @@ static int __ap_revise_reserved(struct device *dev, void *dummy)
 		drvres = to_ap_drv(dev->driver)->flags
 			& AP_DRIVER_FLAG_DEFAULT;
 		if (!!devres != !!drvres) {
-			pr_debug("%s reprobing queue=%02x.%04x\n",
-				 __func__, card, queue);
+			pr_debug("reprobing queue=%02x.%04x\n", card, queue);
 			rc = device_reprobe(dev);
 			if (rc)
 				AP_DBF_WARN("%s reprobing queue=%02x.%04x failed\n",
@@ -971,11 +1036,16 @@ int ap_driver_register(struct ap_driver *ap_drv, struct module *owner,
 		       char *name)
 {
 	struct device_driver *drv = &ap_drv->driver;
+	int rc;
 
 	drv->bus = &ap_bus_type;
 	drv->owner = owner;
 	drv->name = name;
-	return driver_register(drv);
+	rc = driver_register(drv);
+
+	ap_check_bindings_complete();
+
+	return rc;
 }
 EXPORT_SYMBOL(ap_driver_register);
 
@@ -995,17 +1065,31 @@ bool ap_bus_force_rescan(void)
 	unsigned long scan_counter = atomic64_read(&ap_scan_bus_count);
 	bool rc = false;
 
-	pr_debug(">%s scan counter=%lu\n", __func__, scan_counter);
+	pr_debug("> scan counter=%lu\n", scan_counter);
 
 	/* Only trigger AP bus scans after the initial scan is done */
 	if (scan_counter <= 0)
 		goto out;
 
+	/*
+	 * There is one unlikely but nevertheless valid scenario where the
+	 * thread holding the mutex may try to send some crypto load but
+	 * all cards are offline so a rescan is triggered which causes
+	 * a recursive call of ap_bus_force_rescan(). A simple return if
+	 * the mutex is already locked by this thread solves this.
+	 */
+	if (mutex_is_locked(&ap_scan_bus_mutex)) {
+		if (ap_scan_bus_task == current)
+			goto out;
+	}
+
 	/* Try to acquire the AP scan bus mutex */
 	if (mutex_trylock(&ap_scan_bus_mutex)) {
 		/* mutex acquired, run the AP bus scan */
+		ap_scan_bus_task = current;
 		ap_scan_bus_result = ap_scan_bus();
 		rc = ap_scan_bus_result;
+		ap_scan_bus_task = NULL;
 		mutex_unlock(&ap_scan_bus_mutex);
 		goto out;
 	}
@@ -1024,7 +1108,7 @@ bool ap_bus_force_rescan(void)
 	mutex_unlock(&ap_scan_bus_mutex);
 
 out:
-	pr_debug("%s rc=%d\n", __func__, rc);
+	pr_debug("rc=%d\n", rc);
 	return rc;
 }
 EXPORT_SYMBOL(ap_bus_force_rescan);
@@ -1038,7 +1122,7 @@ static int ap_bus_cfg_chg(struct notifier_block *nb,
 	if (action != CHSC_NOTIFY_AP_CFG)
 		return NOTIFY_DONE;
 
-	pr_debug("%s config change, forcing bus rescan\n", __func__);
+	pr_debug("config change, forcing bus rescan\n");
 
 	ap_bus_force_rescan();
 
@@ -1845,13 +1929,12 @@ static inline void ap_scan_domains(struct ap_card *ac)
 		}
 		/* if no queue device exists, create a new one */
 		if (!aq) {
-			aq = ap_queue_create(qid, ac->ap_dev.device_type);
+			aq = ap_queue_create(qid, ac);
 			if (!aq) {
 				AP_DBF_WARN("%s(%d,%d) ap_queue_create() failed\n",
 					    __func__, ac->id, dom);
 				continue;
 			}
-			aq->card = ac;
 			aq->config = !decfg;
 			aq->chkstop = chkstop;
 			aq->se_bstate = hwinfo.bs;
@@ -1895,8 +1978,8 @@ static inline void ap_scan_domains(struct ap_card *ac)
 				aq->last_err_rc = AP_RESPONSE_CHECKSTOPPED;
 			}
 			spin_unlock_bh(&aq->lock);
-			pr_debug("%s(%d,%d) queue dev checkstop on\n",
-				 __func__, ac->id, dom);
+			pr_debug("(%d,%d) queue dev checkstop on\n",
+				 ac->id, dom);
 			/* 'receive' pending messages with -EAGAIN */
 			ap_flush_queue(aq);
 			goto put_dev_and_continue;
@@ -1906,8 +1989,8 @@ static inline void ap_scan_domains(struct ap_card *ac)
 			if (aq->dev_state > AP_DEV_STATE_UNINITIATED)
 				_ap_queue_init_state(aq);
 			spin_unlock_bh(&aq->lock);
-			pr_debug("%s(%d,%d) queue dev checkstop off\n",
-				 __func__, ac->id, dom);
+			pr_debug("(%d,%d) queue dev checkstop off\n",
+				 ac->id, dom);
 			goto put_dev_and_continue;
 		}
 		/* config state change */
@@ -1919,8 +2002,8 @@ static inline void ap_scan_domains(struct ap_card *ac)
 				aq->last_err_rc = AP_RESPONSE_DECONFIGURED;
 			}
 			spin_unlock_bh(&aq->lock);
-			pr_debug("%s(%d,%d) queue dev config off\n",
-				 __func__, ac->id, dom);
+			pr_debug("(%d,%d) queue dev config off\n",
+				 ac->id, dom);
 			ap_send_config_uevent(&aq->ap_dev, aq->config);
 			/* 'receive' pending messages with -EAGAIN */
 			ap_flush_queue(aq);
@@ -1931,8 +2014,8 @@ static inline void ap_scan_domains(struct ap_card *ac)
 			if (aq->dev_state > AP_DEV_STATE_UNINITIATED)
 				_ap_queue_init_state(aq);
 			spin_unlock_bh(&aq->lock);
-			pr_debug("%s(%d,%d) queue dev config on\n",
-				 __func__, ac->id, dom);
+			pr_debug("(%d,%d) queue dev config on\n",
+				 ac->id, dom);
 			ap_send_config_uevent(&aq->ap_dev, aq->config);
 			goto put_dev_and_continue;
 		}
@@ -2004,8 +2087,8 @@ static inline void ap_scan_adapter(int ap)
 			ap_scan_rm_card_dev_and_queue_devs(ac);
 			put_device(dev);
 		} else {
-			pr_debug("%s(%d) no type info (no APQN found), ignored\n",
-				 __func__, ap);
+			pr_debug("(%d) no type info (no APQN found), ignored\n",
+				 ap);
 		}
 		return;
 	}
@@ -2017,8 +2100,7 @@ static inline void ap_scan_adapter(int ap)
 			ap_scan_rm_card_dev_and_queue_devs(ac);
 			put_device(dev);
 		} else {
-			pr_debug("%s(%d) no valid type (0) info, ignored\n",
-				 __func__, ap);
+			pr_debug("(%d) no valid type (0) info, ignored\n", ap);
 		}
 		return;
 	}
@@ -2197,7 +2279,7 @@ static bool ap_scan_bus(void)
 	bool config_changed;
 	int ap;
 
-	pr_debug(">%s\n", __func__);
+	pr_debug(">\n");
 
 	/* (re-)fetch configuration via QCI */
 	config_changed = ap_get_configuration();
@@ -2238,7 +2320,7 @@ static bool ap_scan_bus(void)
 	}
 
 	if (atomic64_inc_return(&ap_scan_bus_count) == 1) {
-		pr_debug("%s init scan complete\n", __func__);
+		pr_debug("init scan complete\n");
 		ap_send_init_scan_done_uevent();
 	}
 
@@ -2246,7 +2328,7 @@ static bool ap_scan_bus(void)
 
 	mod_timer(&ap_scan_bus_timer, jiffies + ap_scan_bus_time * HZ);
 
-	pr_debug("<%s config_changed=%d\n", __func__, config_changed);
+	pr_debug("< config_changed=%d\n", config_changed);
 
 	return config_changed;
 }
@@ -2279,7 +2361,9 @@ static void ap_scan_bus_wq_callback(struct work_struct *unused)
 	 * system_long_wq which invokes this function here again.
 	 */
 	if (mutex_trylock(&ap_scan_bus_mutex)) {
+		ap_scan_bus_task = current;
 		ap_scan_bus_result = ap_scan_bus();
+		ap_scan_bus_task = NULL;
 		mutex_unlock(&ap_scan_bus_mutex);
 	}
 }
@@ -2305,10 +2389,9 @@ static inline int __init ap_async_init(void)
 	 * Setup the high resolution poll timer.
 	 * If we are running under z/VM adjust polling to z/VM polling rate.
 	 */
-	if (MACHINE_IS_VM)
+	if (machine_is_vm())
 		poll_high_timeout = 1500000;
-	hrtimer_init(&ap_poll_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
-	ap_poll_timer.function = ap_poll_timeout;
+	hrtimer_setup(&ap_poll_timer, ap_poll_timeout, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
 
 	queue_work(system_long_wq, &ap_scan_bus_work);
 
@@ -2412,6 +2495,14 @@ static int __init ap_module_init(void)
 	/* init ap_queue hashtable */
 	hash_init(ap_queues);
 
+	/* create ap msg buffer memory pool */
+	ap_msg_pool = mempool_create_kmalloc_pool(ap_msg_pool_min_items,
+						  AP_DEFAULT_MAX_MSG_SIZE);
+	if (!ap_msg_pool) {
+		rc = -ENOMEM;
+		goto out;
+	}
+
 	/* set up the AP permissions (ioctls, ap and aq masks) */
 	ap_perms_init();
 
@@ -2458,6 +2549,7 @@ out_device:
 out_bus:
 	bus_unregister(&ap_bus_type);
 out:
+	mempool_destroy(ap_msg_pool);
 	ap_debug_exit();
 	return rc;
 }
@@ -2468,6 +2560,7 @@ static void __exit ap_module_exit(void)
 	ap_irq_exit();
 	root_device_unregister(ap_root_device);
 	bus_unregister(&ap_bus_type);
+	mempool_destroy(ap_msg_pool);
 	ap_debug_exit();
 }
 

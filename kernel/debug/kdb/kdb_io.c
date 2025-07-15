@@ -206,7 +206,7 @@ char kdb_getchar(void)
  */
 static void kdb_position_cursor(char *prompt, char *buffer, char *cp)
 {
-	kdb_printf("\r%s", kdb_prompt_str);
+	kdb_printf("\r%s", prompt);
 	if (cp > buffer)
 		kdb_printf("%.*s", (int)(cp - buffer), buffer);
 }
@@ -334,7 +334,7 @@ poll_again:
 		*cp = '\0';
 		p_tmp = strrchr(buffer, ' ');
 		p_tmp = (p_tmp ? p_tmp + 1 : buffer);
-		strscpy(tmpbuffer, p_tmp, sizeof(tmpbuffer));
+		strscpy(tmpbuffer, p_tmp);
 		*cp = tmp;
 
 		len = strlen(tmpbuffer);
@@ -362,7 +362,7 @@ poll_again:
 			if (i >= dtab_count)
 				kdb_printf("...");
 			kdb_printf("\n");
-			kdb_printf(kdb_prompt_str);
+			kdb_printf("%s",  kdb_prompt_str);
 			kdb_printf("%s", buffer);
 			if (cp != lastchar)
 				kdb_position_cursor(kdb_prompt_str, buffer, cp);
@@ -452,8 +452,8 @@ poll_again:
 char *kdb_getstr(char *buffer, size_t bufsize, const char *prompt)
 {
 	if (prompt && kdb_prompt_str != prompt)
-		strscpy(kdb_prompt_str, prompt, CMD_BUFLEN);
-	kdb_printf(kdb_prompt_str);
+		strscpy(kdb_prompt_str, prompt);
+	kdb_printf("%s", kdb_prompt_str);
 	kdb_nextline = 1;	/* Prompt and input resets line number */
 	return kdb_read(buffer, bufsize);
 }

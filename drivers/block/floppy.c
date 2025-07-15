@@ -937,7 +937,7 @@ static void floppy_off(unsigned int drive)
 	if (!(fdc_state[fdc].dor & (0x10 << UNIT(drive))))
 		return;
 
-	del_timer(motor_off_timer + drive);
+	timer_delete(motor_off_timer + drive);
 
 	/* make spindle stop in a position which minimizes spinup time
 	 * next time */
@@ -1918,7 +1918,7 @@ static int start_motor(void (*function)(void))
 		mask &= ~(0x10 << UNIT(current_drive));
 
 	/* starts motor and selects floppy */
-	del_timer(motor_off_timer + current_drive);
+	timer_delete(motor_off_timer + current_drive);
 	set_dor(current_fdc, mask, data);
 
 	/* wait_for_completion also schedules reset if needed. */
@@ -4516,7 +4516,8 @@ static bool floppy_available(int drive)
 static int floppy_alloc_disk(unsigned int drive, unsigned int type)
 {
 	struct queue_limits lim = {
-		.max_hw_sectors = 64,
+		.max_hw_sectors		= 64,
+		.features		= BLK_FEAT_ROTATIONAL,
 	};
 	struct gendisk *disk;
 
@@ -4595,7 +4596,6 @@ static int __init do_floppy_init(void)
 		tag_sets[drive].nr_maps = 1;
 		tag_sets[drive].queue_depth = 2;
 		tag_sets[drive].numa_node = NUMA_NO_NODE;
-		tag_sets[drive].flags = BLK_MQ_F_SHOULD_MERGE;
 		err = blk_mq_alloc_tag_set(&tag_sets[drive]);
 		if (err)
 			goto out_put_disk;
@@ -4762,7 +4762,7 @@ out_put_disk:
 	for (drive = 0; drive < N_DRIVE; drive++) {
 		if (!disks[drive][0])
 			break;
-		del_timer_sync(&motor_off_timer[drive]);
+		timer_delete_sync(&motor_off_timer[drive]);
 		put_disk(disks[drive][0]);
 		blk_mq_free_tag_set(&tag_sets[drive]);
 	}
@@ -4983,7 +4983,7 @@ static void __exit floppy_module_exit(void)
 	destroy_workqueue(floppy_wq);
 
 	for (drive = 0; drive < N_DRIVE; drive++) {
-		del_timer_sync(&motor_off_timer[drive]);
+		timer_delete_sync(&motor_off_timer[drive]);
 
 		if (floppy_available(drive)) {
 			for (i = 0; i < ARRAY_SIZE(floppy_type); i++) {
@@ -5016,6 +5016,7 @@ module_param(floppy, charp, 0);
 module_param(FLOPPY_IRQ, int, 0);
 module_param(FLOPPY_DMA, int, 0);
 MODULE_AUTHOR("Alain L. Knaff");
+MODULE_DESCRIPTION("Normal floppy disk support");
 MODULE_LICENSE("GPL");
 
 /* This doesn't actually get used other than for module information */

@@ -177,11 +177,15 @@ struct inv_icm42600_state {
  * struct inv_icm42600_sensor_state - sensor state variables
  * @scales:		table of scales.
  * @scales_len:		length (nb of items) of the scales table.
+ * @power_mode:		sensor requested power mode (for common frequencies)
+ * @filter:		sensor filter.
  * @ts:			timestamp module states.
  */
 struct inv_icm42600_sensor_state {
 	const int *scales;
 	size_t scales_len;
+	enum inv_icm42600_sensor_mode power_mode;
+	enum inv_icm42600_filter filter;
 	struct inv_sensors_timestamp ts;
 };
 
@@ -399,6 +403,7 @@ struct inv_icm42600_sensor_state {
 typedef int (*inv_icm42600_bus_setup)(struct inv_icm42600_state *);
 
 extern const struct regmap_config inv_icm42600_regmap_config;
+extern const struct regmap_config inv_icm42600_spi_regmap_config;
 extern const struct dev_pm_ops inv_icm42600_pm_ops;
 
 const struct iio_mount_matrix *
@@ -421,7 +426,7 @@ int inv_icm42600_set_temp_conf(struct inv_icm42600_state *st, bool enable,
 int inv_icm42600_debugfs_reg(struct iio_dev *indio_dev, unsigned int reg,
 			     unsigned int writeval, unsigned int *readval);
 
-int inv_icm42600_core_probe(struct regmap *regmap, int chip, int irq,
+int inv_icm42600_core_probe(struct regmap *regmap, int chip,
 			    inv_icm42600_bus_setup bus_setup);
 
 struct iio_dev *inv_icm42600_gyro_init(struct inv_icm42600_state *st);

@@ -64,6 +64,13 @@
 
 #define MAX_SGI 16
 
+/*
+ * Module parameters
+ */
+static int tx_poll_period = 5;
+module_param_named(tx_poll_period, tx_poll_period, int, 0644);
+MODULE_PARM_DESC(tx_poll_period, "Poll period waiting for ack after send.");
+
 /**
  * struct zynqmp_ipi_mchan - Description of a Xilinx ZynqMP IPI mailbox channel
  * @is_opened: indicate if the IPI channel is opened
@@ -537,7 +544,7 @@ static int zynqmp_ipi_mbox_probe(struct zynqmp_ipi_mbox *ipi_mbox,
 	mbox->num_chans = 2;
 	mbox->txdone_irq = false;
 	mbox->txdone_poll = true;
-	mbox->txpoll_period = 5;
+	mbox->txpoll_period = tx_poll_period;
 	mbox->of_xlate = zynqmp_ipi_of_xlate;
 	chans = devm_kzalloc(mdev, 2 * sizeof(*chans), GFP_KERNEL);
 	if (!chans)
@@ -898,7 +905,7 @@ static int zynqmp_ipi_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *nc, *np = pdev->dev.of_node;
-	struct zynqmp_ipi_pdata __percpu *pdata;
+	struct zynqmp_ipi_pdata *pdata;
 	struct of_phandle_args out_irq;
 	struct zynqmp_ipi_mbox *mbox;
 	int num_mboxes, ret = -EINVAL;
@@ -933,10 +940,10 @@ static int zynqmp_ipi_probe(struct platform_device *pdev)
 	pdata->num_mboxes = num_mboxes;
 
 	mbox = pdata->ipi_mboxes;
-	mbox->setup_ipi_fn = ipi_fn;
-
 	for_each_available_child_of_node(np, nc) {
 		mbox->pdata = pdata;
+		mbox->setup_ipi_fn = ipi_fn;
+
 		ret = zynqmp_ipi_mbox_probe(mbox, nc);
 		if (ret) {
 			of_node_put(nc);
@@ -1008,7 +1015,7 @@ MODULE_DEVICE_TABLE(of, zynqmp_ipi_of_match);
 
 static struct platform_driver zynqmp_ipi_driver = {
 	.probe = zynqmp_ipi_probe,
-	.remove_new = zynqmp_ipi_remove,
+	.remove = zynqmp_ipi_remove,
 	.driver = {
 		   .name = "zynqmp-ipi",
 		   .of_match_table = of_match_ptr(zynqmp_ipi_of_match),

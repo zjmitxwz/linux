@@ -54,10 +54,8 @@ endif
 
 $(obj)/4xx.o: BOOTTARGETFLAGS += -mcpu=405
 $(obj)/ebony.o: BOOTTARGETFLAGS += -mcpu=440
-$(obj)/cuboot-hotfoot.o: BOOTTARGETFLAGS += -mcpu=405
 $(obj)/cuboot-taishan.o: BOOTTARGETFLAGS += -mcpu=440
 $(obj)/cuboot-katmai.o: BOOTTARGETFLAGS += -mcpu=440
-$(obj)/cuboot-acadia.o: BOOTTARGETFLAGS += -mcpu=405
 $(obj)/treeboot-iss4xx.o: BOOTTARGETFLAGS += -mcpu=405
 $(obj)/treeboot-currituck.o: BOOTTARGETFLAGS += -mcpu=405
 $(obj)/treeboot-akebono.o: BOOTTARGETFLAGS += -mcpu=405
@@ -72,6 +70,7 @@ BOOTCPPFLAGS	:= -nostdinc $(LINUXINCLUDE)
 BOOTCPPFLAGS	+= -isystem $(shell $(BOOTCC) -print-file-name=include)
 
 BOOTCFLAGS	:= $(BOOTTARGETFLAGS) \
+		   -std=gnu11 \
 		   -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 		   -fno-strict-aliasing -O2 \
 		   -msoft-float -mno-altivec -mno-vsx \
@@ -146,7 +145,6 @@ src-wlib-$(CONFIG_PPC_POWERNV) += opal-calls.S opal.c
 ifndef CONFIG_PPC64_BOOT_WRAPPER
 src-wlib-y += crtsavres.S
 endif
-src-wlib-$(CONFIG_40x) += 4xx.c planetcore.c
 src-wlib-$(CONFIG_44x) += 4xx.c ebony.c bamboo.c
 src-wlib-$(CONFIG_PPC_8xx) += mpc8xx.c planetcore.c fsl-soc.c
 src-wlib-$(CONFIG_PPC_82xx) += pq2.c fsl-soc.c planetcore.c
@@ -154,9 +152,6 @@ src-wlib-$(CONFIG_EMBEDDED6xx) += ugecon.c fsl-soc.c
 src-wlib-$(CONFIG_CPM) += cpm-serial.c
 
 src-plat-y := of.c epapr.c
-src-plat-$(CONFIG_40x) += fixed-head.S cuboot-hotfoot.c \
-				cuboot-acadia.c \
-				cuboot-kilauea.c simpleboot.c
 src-plat-$(CONFIG_44x) += treeboot-ebony.c cuboot-ebony.c treeboot-bamboo.c \
 				cuboot-bamboo.c cuboot-sam440ep.c \
 				cuboot-sequoia.c cuboot-rainier.c \
@@ -179,7 +174,6 @@ src-plat-$(CONFIG_PPC_PS3) += ps3-head.S ps3-hvcall.S ps3.c
 src-plat-$(CONFIG_EPAPR_BOOT) += epapr.c epapr-wrapper.c
 src-plat-$(CONFIG_PPC_PSERIES) += pseries-head.S
 src-plat-$(CONFIG_PPC_POWERNV) += pseries-head.S
-src-plat-$(CONFIG_PPC_IBM_CELL_BLADE) += pseries-head.S
 src-plat-$(CONFIG_MVME7100) += motload-head.S mvme7100.c
 
 src-plat-$(CONFIG_PPC_MICROWATT) += fixed-head.S microwatt.c
@@ -282,8 +276,6 @@ quiet_cmd_wrap	= WRAP    $@
 
 image-$(CONFIG_PPC_PSERIES)		+= zImage.pseries
 image-$(CONFIG_PPC_POWERNV)		+= zImage.pseries
-image-$(CONFIG_PPC_MAPLE)		+= zImage.maple
-image-$(CONFIG_PPC_IBM_CELL_BLADE)	+= zImage.pseries
 image-$(CONFIG_PPC_PS3)			+= dtbImage.ps3
 image-$(CONFIG_PPC_CHRP)		+= zImage.chrp
 image-$(CONFIG_PPC_EFIKA)		+= zImage.chrp
@@ -299,11 +291,6 @@ image-$(CONFIG_EPAPR_BOOT)		+= zImage.epapr
 # They are only required on boards which do not have FDT support in firmware.
 # Boards with newish u-boot firmware can use the uImage target above
 #
-
-# Board ports in arch/powerpc/platform/40x/Kconfig
-image-$(CONFIG_HOTFOOT)			+= cuImage.hotfoot
-image-$(CONFIG_ACADIA)			+= cuImage.acadia
-image-$(CONFIG_OBS600)			+= uImage.obs600
 
 # Board ports in arch/powerpc/platform/44x/Kconfig
 image-$(CONFIG_EBONY)			+= treeImage.ebony cuImage.ebony
@@ -455,7 +442,7 @@ $(obj)/zImage.initrd:	$(addprefix $(obj)/, $(initrd-y))
 clean-files += $(image-) $(initrd-) cuImage.* dtbImage.* treeImage.* \
 	zImage zImage.initrd zImage.chrp zImage.coff zImage.holly \
 	zImage.miboot zImage.pmac zImage.pseries \
-	zImage.maple simpleImage.* otheros.bld
+	simpleImage.* otheros.bld
 
 # clean up files cached by wrapper
 clean-kernel-base := vmlinux.strip vmlinux.bin

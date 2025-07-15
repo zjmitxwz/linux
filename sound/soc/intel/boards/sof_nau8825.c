@@ -115,7 +115,7 @@ static int sof_nau8825_hw_params(struct snd_pcm_substream *substream,
 	return ret;
 }
 
-static struct snd_soc_ops sof_nau8825_ops = {
+static const struct snd_soc_ops sof_nau8825_ops = {
 	.hw_params = sof_nau8825_hw_params,
 };
 
@@ -339,7 +339,7 @@ MODULE_AUTHOR("David Lin <ctlin0@nuvoton.com>");
 MODULE_AUTHOR("Mac Chiang <mac.chiang@intel.com>");
 MODULE_AUTHOR("Brent Lu <brent.lu@intel.com>");
 MODULE_LICENSE("GPL");
-MODULE_IMPORT_NS(SND_SOC_INTEL_SOF_BOARD_HELPERS);
-MODULE_IMPORT_NS(SND_SOC_INTEL_SOF_MAXIM_COMMON);
-MODULE_IMPORT_NS(SND_SOC_INTEL_SOF_NUVOTON_COMMON);
-MODULE_IMPORT_NS(SND_SOC_INTEL_SOF_REALTEK_COMMON);
+MODULE_IMPORT_NS("SND_SOC_INTEL_SOF_BOARD_HELPERS");
+MODULE_IMPORT_NS("SND_SOC_INTEL_SOF_MAXIM_COMMON");
+MODULE_IMPORT_NS("SND_SOC_INTEL_SOF_NUVOTON_COMMON");
+MODULE_IMPORT_NS("SND_SOC_INTEL_SOF_REALTEK_COMMON");

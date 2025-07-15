@@ -1224,7 +1224,6 @@ static int __imm_attach(struct parport *pb)
 	host = scsi_host_alloc(&imm_template, sizeof(imm_struct *));
 	if (!host)
 		goto out1;
-	host->no_highmem = true;
 	host->io_port = pb->base;
 	host->n_io_port = ports;
 	host->dma_channel = -1;
@@ -1275,8 +1274,8 @@ static struct parport_driver imm_driver = {
 	.name		= "imm",
 	.match_port	= imm_attach,
 	.detach		= imm_detach,
-	.devmodel	= true,
 };
 module_parport_driver(imm_driver);
 
+MODULE_DESCRIPTION("IOMEGA MatchMaker parallel port SCSI host adapter driver");
 MODULE_LICENSE("GPL");

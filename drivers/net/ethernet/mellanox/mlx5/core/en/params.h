@@ -33,7 +33,6 @@ struct mlx5e_sq_param {
 	struct mlx5_wq_param       wq;
 	bool                       is_mpw;
 	bool                       is_tls;
-	bool                       is_xdp_mb;
 	u16                        stop_room;
 };
 
@@ -108,6 +107,7 @@ u32 mlx5e_shampo_hd_per_wqe(struct mlx5_core_dev *mdev,
 u32 mlx5e_shampo_hd_per_wq(struct mlx5_core_dev *mdev,
 			   struct mlx5e_params *params,
 			   struct mlx5e_rq_param *rq_param);
+u32 mlx5e_choose_lro_timeout(struct mlx5_core_dev *mdev, u32 wanted_timeout);
 u8 mlx5e_mpwqe_get_log_stride_size(struct mlx5_core_dev *mdev,
 				   struct mlx5e_params *params,
 				   struct mlx5e_xsk_param *xsk);

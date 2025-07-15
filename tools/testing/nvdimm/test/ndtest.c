@@ -883,7 +883,7 @@ static const struct platform_device_id ndtest_id[] = {
 
 static struct platform_driver ndtest_driver = {
 	.probe = ndtest_probe,
-	.remove_new = ndtest_remove,
+	.remove = ndtest_remove,
 	.driver = {
 		.name = KBUILD_MODNAME,
 	},
@@ -987,5 +987,6 @@ static __exit void ndtest_exit(void)
 
 module_init(ndtest_init);
 module_exit(ndtest_exit);
+MODULE_DESCRIPTION("Test non-NFIT devices");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("IBM Corporation");

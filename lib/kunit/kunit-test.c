@@ -805,6 +805,8 @@ static void kunit_device_driver_test(struct kunit *test)
 	struct device *test_device;
 	struct driver_test_state *test_state = kunit_kzalloc(test, sizeof(*test_state), GFP_KERNEL);
 
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, test_state);
+
 	test->priv = test_state;
 	test_driver = kunit_driver_create(test, "my_driver");
 
@@ -871,4 +873,5 @@ kunit_test_suites(&kunit_try_catch_test_suite, &kunit_resource_test_suite,
 		  &kunit_current_test_suite, &kunit_device_test_suite,
 		  &kunit_fault_test_suite);
 
+MODULE_DESCRIPTION("KUnit test for core test infrastructure");
 MODULE_LICENSE("GPL v2");

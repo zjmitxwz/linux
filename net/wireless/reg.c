@@ -5,7 +5,7 @@
  * Copyright 2008-2011	Luis R. Rodriguez <mcgrof@qca.qualcomm.com>
  * Copyright 2013-2014  Intel Mobile Communications GmbH
  * Copyright      2017  Intel Deutschland GmbH
- * Copyright (C) 2018 - 2024 Intel Corporation
+ * Copyright (C) 2018 - 2025 Intel Corporation
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -407,7 +407,8 @@ static bool is_an_alpha2(const char *alpha2)
 {
 	if (!alpha2)
 		return false;
-	return isalpha(alpha2[0]) && isalpha(alpha2[1]);
+	return isascii(alpha2[0]) && isalpha(alpha2[0]) &&
+	       isascii(alpha2[1]) && isalpha(alpha2[1]);
 }
 
 static bool alpha2_equal(const char *alpha2_x, const char *alpha2_y)
@@ -1147,7 +1148,7 @@ static const struct ieee80211_regdomain *reg_get_regdomain(struct wiphy *wiphy)
 
 	/*
 	 * Follow the driver's regulatory domain, if present, unless a country
-	 * IE has been processed or a user wants to help complaince further
+	 * IE has been processed or a user wants to help compliance further
 	 */
 	if (lr->initiator != NL80211_REGDOM_SET_BY_COUNTRY_IE &&
 	    lr->initiator != NL80211_REGDOM_SET_BY_USER &&
@@ -1600,6 +1601,10 @@ static u32 map_regdom_flags(u32 rd_flags)
 		channel_flags |= IEEE80211_CHAN_NO_6GHZ_AFC_CLIENT;
 	if (rd_flags & NL80211_RRF_PSD)
 		channel_flags |= IEEE80211_CHAN_PSD;
+	if (rd_flags & NL80211_RRF_ALLOW_6GHZ_VLP_AP)
+		channel_flags |= IEEE80211_CHAN_ALLOW_6GHZ_VLP_AP;
+	if (rd_flags & NL80211_RRF_ALLOW_20MHZ_ACTIVITY)
+		channel_flags |= IEEE80211_CHAN_ALLOW_20MHZ_ACTIVITY;
 	return channel_flags;
 }
 
@@ -2463,11 +2468,11 @@ static void reg_leave_invalid_chans(struct wiphy *wiphy)
 	struct wireless_dev *wdev;
 	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
 
-	wiphy_lock(wiphy);
+	guard(wiphy)(wiphy);
+
 	list_for_each_entry(wdev, &rdev->wiphy.wdev_list, list)
 		if (!reg_wdev_chan_valid(wiphy, wdev))
 			cfg80211_leave(rdev, wdev);
-	wiphy_unlock(wiphy);
 }
 
 static void reg_check_chans_work(struct work_struct *work)
@@ -2647,13 +2652,11 @@ void wiphy_apply_custom_regulatory(struct wiphy *wiphy,
 		return;
 
 	rtnl_lock();
-	wiphy_lock(wiphy);
-
-	tmp = get_wiphy_regdom(wiphy);
-	rcu_assign_pointer(wiphy->regd, new_regd);
-	rcu_free_regdom(tmp);
-
-	wiphy_unlock(wiphy);
+	scoped_guard(wiphy, wiphy) {
+		tmp = get_wiphy_regdom(wiphy);
+		rcu_assign_pointer(wiphy->regd, new_regd);
+		rcu_free_regdom(tmp);
+	}
 	rtnl_unlock();
 }
 EXPORT_SYMBOL(wiphy_apply_custom_regulatory);
@@ -2823,9 +2826,9 @@ reg_process_hint_driver(struct wiphy *wiphy,
 
 		tmp = get_wiphy_regdom(wiphy);
 		ASSERT_RTNL();
-		wiphy_lock(wiphy);
-		rcu_assign_pointer(wiphy->regd, regd);
-		wiphy_unlock(wiphy);
+		scoped_guard(wiphy, wiphy) {
+			rcu_assign_pointer(wiphy->regd, regd);
+		}
 		rcu_free_regdom(tmp);
 	}
 
@@ -3203,9 +3206,9 @@ static void reg_process_self_managed_hints(void)
 	ASSERT_RTNL();
 
 	for_each_rdev(rdev) {
-		wiphy_lock(&rdev->wiphy);
+		guard(wiphy)(&rdev->wiphy);
+
 		reg_process_self_managed_hint(&rdev->wiphy);
-		wiphy_unlock(&rdev->wiphy);
 	}
 
 	reg_check_channels();
@@ -3598,14 +3601,12 @@ static bool is_wiphy_all_set_reg_flag(enum ieee80211_regulatory_flags flag)
 	struct wireless_dev *wdev;
 
 	for_each_rdev(rdev) {
-		wiphy_lock(&rdev->wiphy);
+		guard(wiphy)(&rdev->wiphy);
+
 		list_for_each_entry(wdev, &rdev->wiphy.wdev_list, list) {
-			if (!(wdev->wiphy->regulatory_flags & flag)) {
-				wiphy_unlock(&rdev->wiphy);
+			if (!(wdev->wiphy->regulatory_flags & flag))
 				return false;
-			}
 		}
-		wiphy_unlock(&rdev->wiphy);
 	}
 
 	return true;
@@ -3881,19 +3882,18 @@ static int reg_set_rd_driver(const struct ieee80211_regdomain *rd,
 
 	if (!driver_request->intersect) {
 		ASSERT_RTNL();
-		wiphy_lock(request_wiphy);
-		if (request_wiphy->regd)
-			tmp = get_wiphy_regdom(request_wiphy);
+		scoped_guard(wiphy, request_wiphy) {
+			if (request_wiphy->regd)
+				tmp = get_wiphy_regdom(request_wiphy);
 
-		regd = reg_copy_regd(rd);
-		if (IS_ERR(regd)) {
-			wiphy_unlock(request_wiphy);
-			return PTR_ERR(regd);
+			regd = reg_copy_regd(rd);
+			if (IS_ERR(regd))
+				return PTR_ERR(regd);
+
+			rcu_assign_pointer(request_wiphy->regd, regd);
+			rcu_free_regdom(tmp);
 		}
 
-		rcu_assign_pointer(request_wiphy->regd, regd);
-		rcu_free_regdom(tmp);
-		wiphy_unlock(request_wiphy);
 		reset_regdomains(false, rd);
 		return 0;
 	}
@@ -4227,6 +4227,8 @@ EXPORT_SYMBOL(regulatory_pre_cac_allowed);
 static void cfg80211_check_and_end_cac(struct cfg80211_registered_device *rdev)
 {
 	struct wireless_dev *wdev;
+	unsigned int link_id;
+
 	/* If we finished CAC or received radar, we should end any
 	 * CAC running on the same channels.
 	 * the check !cfg80211_chandef_dfs_usable contain 2 options:
@@ -4239,16 +4241,17 @@ static void cfg80211_check_and_end_cac(struct cfg80211_registered_device *rdev)
 	list_for_each_entry(wdev, &rdev->wiphy.wdev_list, list) {
 		struct cfg80211_chan_def *chandef;
 
-		if (!wdev->cac_started)
-			continue;
+		for_each_valid_link(wdev, link_id) {
+			if (!wdev->links[link_id].cac_started)
+				continue;
 
-		/* FIXME: radar detection is tied to link 0 for now */
-		chandef = wdev_chandef(wdev, 0);
-		if (!chandef)
-			continue;
+			chandef = wdev_chandef(wdev, link_id);
+			if (!chandef)
+				continue;
 
-		if (!cfg80211_chandef_dfs_usable(&rdev->wiphy, chandef))
-			rdev_end_cac(rdev, wdev->netdev);
+			if (!cfg80211_chandef_dfs_usable(&rdev->wiphy, chandef))
+				rdev_end_cac(rdev, wdev->netdev, link_id);
+		}
 	}
 }
 

@@ -21,6 +21,7 @@
 #include <linux/seq_file.h>
 #include <linux/vmalloc.h>
 
+#include <asm/machine.h>
 #include <asm/ccwdev.h>
 #include <asm/ebcdic.h>
 #include <asm/idals.h>
@@ -1492,7 +1493,7 @@ static void dasd_device_timeout(struct timer_list *t)
 	unsigned long flags;
 	struct dasd_device *device;
 
-	device = from_timer(device, t, timer);
+	device = timer_container_of(device, t, timer);
 	spin_lock_irqsave(get_ccwdev_lock(device->cdev), flags);
 	/* re-activate request queue */
 	dasd_device_remove_stop_bits(device, DASD_STOPPED_PENDING);
@@ -1506,7 +1507,7 @@ static void dasd_device_timeout(struct timer_list *t)
 void dasd_device_set_timer(struct dasd_device *device, int expires)
 {
 	if (expires == 0)
-		del_timer(&device->timer);
+		timer_delete(&device->timer);
 	else
 		mod_timer(&device->timer, jiffies + expires);
 }
@@ -1517,7 +1518,7 @@ EXPORT_SYMBOL(dasd_device_set_timer);
  */
 void dasd_device_clear_timer(struct dasd_device *device)
 {
-	del_timer(&device->timer);
+	timer_delete(&device->timer);
 }
 EXPORT_SYMBOL(dasd_device_clear_timer);
 
@@ -1601,9 +1602,15 @@ static int dasd_ese_needs_format(struct dasd_block *block, struct irb *irb)
 	if (!sense)
 		return 0;
 
-	return !!(sense[1] & SNS1_NO_REC_FOUND) ||
-		!!(sense[1] & SNS1_FILE_PROTECTED) ||
-		scsw_cstat(&irb->scsw) == SCHN_STAT_INCORR_LEN;
+	if (sense[1] & SNS1_NO_REC_FOUND)
+		return 1;
+
+	if ((sense[1] & SNS1_INV_TRACK_FORMAT) &&
+	    scsw_is_tm(&irb->scsw) &&
+	    !(sense[2] & SNS2_ENV_DATA_PRESENT))
+		return 1;
+
+	return 0;
 }
 
 static int dasd_ese_oos_cond(u8 *sense)
@@ -1624,7 +1631,7 @@ void dasd_int_handler(struct ccw_device *cdev, unsigned long intparm,
 	struct dasd_device *device;
 	unsigned long now;
 	int nrf_suppressed = 0;
-	int fp_suppressed = 0;
+	int it_suppressed = 0;
 	struct request *req;
 	u8 *sense = NULL;
 	int expires;
@@ -1679,8 +1686,9 @@ void dasd_int_handler(struct ccw_device *cdev, unsigned long intparm,
 		 */
 		sense = dasd_get_sense(irb);
 		if (sense) {
-			fp_suppressed = (sense[1] & SNS1_FILE_PROTECTED) &&
-				test_bit(DASD_CQR_SUPPRESS_FP, &cqr->flags);
+			it_suppressed =	(sense[1] & SNS1_INV_TRACK_FORMAT) &&
+				!(sense[2] & SNS2_ENV_DATA_PRESENT) &&
+				test_bit(DASD_CQR_SUPPRESS_IT, &cqr->flags);
 			nrf_suppressed = (sense[1] & SNS1_NO_REC_FOUND) &&
 				test_bit(DASD_CQR_SUPPRESS_NRF, &cqr->flags);
 
@@ -1695,7 +1703,7 @@ void dasd_int_handler(struct ccw_device *cdev, unsigned long intparm,
 				return;
 			}
 		}
-		if (!(fp_suppressed || nrf_suppressed))
+		if (!(it_suppressed || nrf_suppressed))
 			device->discipline->dump_sense_dbf(device, irb, "int");
 
 		if (device->features & DASD_FEATURE_ERPLOG)
@@ -2110,7 +2118,7 @@ int dasd_flush_device_queue(struct dasd_device *device)
 		case DASD_CQR_IN_IO:
 			rc = device->discipline->term_IO(cqr);
 			if (rc) {
-				/* unable to terminate requeust */
+				/* unable to terminate request */
 				dev_err(&device->cdev->dev,
 					"Flushing the DASD request queue failed\n");
 				/* stop flush processing */
@@ -2459,14 +2467,17 @@ retry:
 	rc = 0;
 	list_for_each_entry_safe(cqr, n, ccw_queue, blocklist) {
 		/*
-		 * In some cases the 'File Protected' or 'Incorrect Length'
-		 * error might be expected and error recovery would be
-		 * unnecessary in these cases.	Check if the according suppress
-		 * bit is set.
+		 * In some cases certain errors might be expected and
+		 * error recovery would be unnecessary in these cases.
+		 * Check if the according suppress bit is set.
 		 */
 		sense = dasd_get_sense(&cqr->irb);
-		if (sense && sense[1] & SNS1_FILE_PROTECTED &&
-		    test_bit(DASD_CQR_SUPPRESS_FP, &cqr->flags))
+		if (sense && (sense[1] & SNS1_INV_TRACK_FORMAT) &&
+		    !(sense[2] & SNS2_ENV_DATA_PRESENT) &&
+		    test_bit(DASD_CQR_SUPPRESS_IT, &cqr->flags))
+			continue;
+		if (sense && (sense[1] & SNS1_NO_REC_FOUND) &&
+		    test_bit(DASD_CQR_SUPPRESS_NRF, &cqr->flags))
 			continue;
 		if (scsw_cstat(&cqr->irb.scsw) == 0x40 &&
 		    test_bit(DASD_CQR_SUPPRESS_IL, &cqr->flags))
@@ -2666,7 +2677,7 @@ static void dasd_block_timeout(struct timer_list *t)
 	unsigned long flags;
 	struct dasd_block *block;
 
-	block = from_timer(block, t, timer);
+	block = timer_container_of(block, t, timer);
 	spin_lock_irqsave(get_ccwdev_lock(block->base->cdev), flags);
 	/* re-activate request queue */
 	dasd_device_remove_stop_bits(block->base, DASD_STOPPED_PENDING);
@@ -2681,7 +2692,7 @@ static void dasd_block_timeout(struct timer_list *t)
 void dasd_block_set_timer(struct dasd_block *block, int expires)
 {
 	if (expires == 0)
-		del_timer(&block->timer);
+		timer_delete(&block->timer);
 	else
 		mod_timer(&block->timer, jiffies + expires);
 }
@@ -2692,7 +2703,7 @@ EXPORT_SYMBOL(dasd_block_set_timer);
  */
 void dasd_block_clear_timer(struct dasd_block *block)
 {
-	del_timer(&block->timer);
+	timer_delete(&block->timer);
 }
 EXPORT_SYMBOL(dasd_block_clear_timer);
 
@@ -3372,7 +3383,7 @@ int dasd_device_is_ro(struct dasd_device *device)
 	struct diag210 diag_data;
 	int rc;
 
-	if (!MACHINE_IS_VM)
+	if (!machine_is_vm())
 		return 0;
 	ccw_device_get_id(device->cdev, &dev_id);
 	memset(&diag_data, 0, sizeof(diag_data));

@@ -7,6 +7,12 @@ struct io_issue_def {
 	unsigned		needs_file : 1;
 	/* should block plug */
 	unsigned		plug : 1;
+	/* supports ioprio */
+	unsigned		ioprio : 1;
+	/* supports iopoll */
+	unsigned		iopoll : 1;
+	/* op supports buffer selection */
+	unsigned		buffer_select : 1;
 	/* hash wq insertion if file is a regular file */
 	unsigned		hash_reg_file : 1;
 	/* unbound wq insertion if file is a non-regular file */
@@ -15,16 +21,8 @@ struct io_issue_def {
 	unsigned		pollin : 1;
 	unsigned		pollout : 1;
 	unsigned		poll_exclusive : 1;
-	/* op supports buffer selection */
-	unsigned		buffer_select : 1;
-	/* opcode is not supported by this kernel */
-	unsigned		not_supported : 1;
 	/* skip auditing */
 	unsigned		audit_skip : 1;
-	/* supports ioprio */
-	unsigned		ioprio : 1;
-	/* supports iopoll */
-	unsigned		iopoll : 1;
 	/* have to be put into the iopoll list */
 	unsigned		iopoll_queue : 1;
 	/* vectored opcode, set if 1) vectored, and 2) handler needs to know */
@@ -46,6 +44,8 @@ struct io_cold_def {
 
 extern const struct io_issue_def io_issue_defs[];
 extern const struct io_cold_def io_cold_defs[];
+
+bool io_uring_op_supported(u8 opcode);
 
 void io_uring_optable_init(void);
 #endif

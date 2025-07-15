@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: (GPL-2.0 OR MIT)
 /* Google virtual Ethernet (gve) driver
  *
- * Copyright (C) 2015-2021 Google, Inc.
+ * Copyright (C) 2015-2024 Google LLC
  */
 
 #include <linux/rtnetlink.h>
@@ -63,18 +63,20 @@ static const char gve_gstrings_rx_stats[][ETH_GSTRING_LEN] = {
 static const char gve_gstrings_tx_stats[][ETH_GSTRING_LEN] = {
 	"tx_posted_desc[%u]", "tx_completed_desc[%u]", "tx_consumed_desc[%u]", "tx_bytes[%u]",
 	"tx_wake[%u]", "tx_stop[%u]", "tx_event_counter[%u]",
-	"tx_dma_mapping_error[%u]", "tx_xsk_wakeup[%u]",
-	"tx_xsk_done[%u]", "tx_xsk_sent[%u]", "tx_xdp_xmit[%u]", "tx_xdp_xmit_errors[%u]"
+	"tx_dma_mapping_error[%u]",
+	"tx_xsk_sent[%u]", "tx_xdp_xmit[%u]", "tx_xdp_xmit_errors[%u]"
 };
 
-static const char gve_gstrings_adminq_stats[][ETH_GSTRING_LEN] = {
+static const char gve_gstrings_adminq_stats[][ETH_GSTRING_LEN] __nonstring_array = {
 	"adminq_prod_cnt", "adminq_cmd_fail", "adminq_timeouts",
 	"adminq_describe_device_cnt", "adminq_cfg_device_resources_cnt",
 	"adminq_register_page_list_cnt", "adminq_unregister_page_list_cnt",
 	"adminq_create_tx_queue_cnt", "adminq_create_rx_queue_cnt",
 	"adminq_destroy_tx_queue_cnt", "adminq_destroy_rx_queue_cnt",
 	"adminq_dcfg_device_resources_cnt", "adminq_set_driver_parameter_cnt",
-	"adminq_report_stats_cnt", "adminq_report_link_speed_cnt", "adminq_get_ptype_map_cnt"
+	"adminq_report_stats_cnt", "adminq_report_link_speed_cnt", "adminq_get_ptype_map_cnt",
+	"adminq_query_flow_rules", "adminq_cfg_flow_rule", "adminq_cfg_rss_cnt",
+	"adminq_query_rss_cnt",
 };
 
 static const char gve_gstrings_priv_flags[][ETH_GSTRING_LEN] = {
@@ -111,7 +113,7 @@ static void gve_get_strings(struct net_device *netdev, u32 stringset, u8 *data)
 						i);
 
 		for (i = 0; i < ARRAY_SIZE(gve_gstrings_adminq_stats); i++)
-			ethtool_puts(&s, gve_gstrings_adminq_stats[i]);
+			ethtool_cpy(&s, gve_gstrings_adminq_stats[i]);
 
 		break;
 
@@ -390,7 +392,9 @@ gve_get_ethtool_stats(struct net_device *netdev,
 				 */
 				data[i++] = 0;
 				data[i++] = 0;
-				data[i++] = tx->dqo_tx.tail - tx->dqo_tx.head;
+				data[i++] =
+					(tx->dqo_tx.tail - tx->dqo_tx.head) &
+					tx->mask;
 			}
 			do {
 				start =
@@ -415,9 +419,7 @@ gve_get_ethtool_stats(struct net_device *netdev,
 					data[i++] = value;
 				}
 			}
-			/* XDP xsk counters */
-			data[i++] = tx->xdp_xsk_wakeup;
-			data[i++] = tx->xdp_xsk_done;
+			/* XDP counters */
 			do {
 				start = u64_stats_fetch_begin(&priv->tx[ring].statss);
 				data[i] = tx->xdp_xsk_sent;
@@ -450,6 +452,10 @@ gve_get_ethtool_stats(struct net_device *netdev,
 	data[i++] = priv->adminq_report_stats_cnt;
 	data[i++] = priv->adminq_report_link_speed_cnt;
 	data[i++] = priv->adminq_get_ptype_map_cnt;
+	data[i++] = priv->adminq_query_flow_rules_cnt;
+	data[i++] = priv->adminq_cfg_flow_rule_cnt;
+	data[i++] = priv->adminq_cfg_rss_cnt;
+	data[i++] = priv->adminq_query_rss_cnt;
 }
 
 static void gve_get_channels(struct net_device *netdev,
@@ -471,11 +477,12 @@ static int gve_set_channels(struct net_device *netdev,
 			    struct ethtool_channels *cmd)
 {
 	struct gve_priv *priv = netdev_priv(netdev);
-	struct gve_queue_config new_tx_cfg = priv->tx_cfg;
-	struct gve_queue_config new_rx_cfg = priv->rx_cfg;
+	struct gve_tx_queue_config new_tx_cfg = priv->tx_cfg;
+	struct gve_rx_queue_config new_rx_cfg = priv->rx_cfg;
 	struct ethtool_channels old_settings;
 	int new_tx = cmd->tx_count;
 	int new_rx = cmd->rx_count;
+	bool reset_rss = false;
 
 	gve_get_channels(netdev, &old_settings);
 
@@ -486,22 +493,27 @@ static int gve_set_channels(struct net_device *netdev,
 	if (!new_rx || !new_tx)
 		return -EINVAL;
 
-	if (priv->num_xdp_queues &&
-	    (new_tx != new_rx || (2 * new_tx > priv->tx_cfg.max_queues))) {
-		dev_err(&priv->pdev->dev, "XDP load failed: The number of configured RX queues should be equal to the number of configured TX queues and the number of configured RX/TX queues should be less than or equal to half the maximum number of RX/TX queues");
-		return -EINVAL;
+	if (priv->xdp_prog) {
+		if (new_tx != new_rx ||
+		    (2 * new_tx > priv->tx_cfg.max_queues)) {
+			dev_err(&priv->pdev->dev, "The number of configured RX queues should be equal to the number of configured TX queues and the number of configured RX/TX queues should be less than or equal to half the maximum number of RX/TX queues when XDP program is installed");
+			return -EINVAL;
+		}
+
+		/* One XDP TX queue per RX queue. */
+		new_tx_cfg.num_xdp_queues = new_rx;
+	} else {
+		new_tx_cfg.num_xdp_queues = 0;
 	}
 
-	if (!netif_carrier_ok(netdev)) {
-		priv->tx_cfg.num_queues = new_tx;
-		priv->rx_cfg.num_queues = new_rx;
-		return 0;
-	}
+	if (new_rx != priv->rx_cfg.num_queues &&
+	    priv->cache_rss_config && !netif_is_rxfh_configured(netdev))
+		reset_rss = true;
 
 	new_tx_cfg.num_queues = new_tx;
 	new_rx_cfg.num_queues = new_rx;
 
-	return gve_adjust_queues(priv, new_rx_cfg, new_tx_cfg);
+	return gve_adjust_queues(priv, new_rx_cfg, new_tx_cfg, reset_rss);
 }
 
 static void gve_get_ringparam(struct net_device *netdev,
@@ -637,8 +649,7 @@ static int gve_set_tunable(struct net_device *netdev,
 	switch (etuna->id) {
 	case ETHTOOL_RX_COPYBREAK:
 	{
-		u32 max_copybreak = gve_is_gqi(priv) ?
-			GVE_DEFAULT_RX_BUFFER_SIZE : priv->data_buffer_size_dqo;
+		u32 max_copybreak = priv->rx_cfg.packet_buffer_size;
 
 		len = *(u32 *)value;
 		if (len > max_copybreak)
@@ -694,7 +705,7 @@ static int gve_set_priv_flags(struct net_device *netdev, u32 flags)
 
 		memset(priv->stats_report->stats, 0, (tx_stats_num + rx_stats_num) *
 				   sizeof(struct stats));
-		del_timer_sync(&priv->stats_report_timer);
+		timer_delete_sync(&priv->stats_report_timer);
 	}
 	return 0;
 }
@@ -772,6 +783,151 @@ static int gve_set_coalesce(struct net_device *netdev,
 	return 0;
 }
 
+static int gve_set_rxnfc(struct net_device *netdev, struct ethtool_rxnfc *cmd)
+{
+	struct gve_priv *priv = netdev_priv(netdev);
+	int err = 0;
+
+	if (!(netdev->features & NETIF_F_NTUPLE))
+		return -EOPNOTSUPP;
+
+	switch (cmd->cmd) {
+	case ETHTOOL_SRXCLSRLINS:
+		err = gve_add_flow_rule(priv, cmd);
+		break;
+	case ETHTOOL_SRXCLSRLDEL:
+		err = gve_del_flow_rule(priv, cmd);
+		break;
+	case ETHTOOL_SRXFH:
+		err = -EOPNOTSUPP;
+		break;
+	default:
+		err = -EOPNOTSUPP;
+		break;
+	}
+
+	return err;
+}
+
+static int gve_get_rxnfc(struct net_device *netdev, struct ethtool_rxnfc *cmd, u32 *rule_locs)
+{
+	struct gve_priv *priv = netdev_priv(netdev);
+	int err = 0;
+
+	switch (cmd->cmd) {
+	case ETHTOOL_GRXRINGS:
+		cmd->data = priv->rx_cfg.num_queues;
+		break;
+	case ETHTOOL_GRXCLSRLCNT:
+		if (!priv->max_flow_rules)
+			return -EOPNOTSUPP;
+
+		err = gve_adminq_query_flow_rules(priv, GVE_FLOW_RULE_QUERY_STATS, 0);
+		if (err)
+			return err;
+
+		cmd->rule_cnt = priv->num_flow_rules;
+		cmd->data = priv->max_flow_rules;
+		break;
+	case ETHTOOL_GRXCLSRULE:
+		err = gve_get_flow_rule_entry(priv, cmd);
+		break;
+	case ETHTOOL_GRXCLSRLALL:
+		err = gve_get_flow_rule_ids(priv, cmd, (u32 *)rule_locs);
+		break;
+	case ETHTOOL_GRXFH:
+		err = -EOPNOTSUPP;
+		break;
+	default:
+		err = -EOPNOTSUPP;
+		break;
+	}
+
+	return err;
+}
+
+static u32 gve_get_rxfh_key_size(struct net_device *netdev)
+{
+	struct gve_priv *priv = netdev_priv(netdev);
+
+	return priv->rss_key_size;
+}
+
+static u32 gve_get_rxfh_indir_size(struct net_device *netdev)
+{
+	struct gve_priv *priv = netdev_priv(netdev);
+
+	return priv->rss_lut_size;
+}
+
+static void gve_get_rss_config_cache(struct gve_priv *priv,
+				     struct ethtool_rxfh_param *rxfh)
+{
+	struct gve_rss_config *rss_config = &priv->rss_config;
+
+	rxfh->hfunc = ETH_RSS_HASH_TOP;
+
+	if (rxfh->key) {
+		rxfh->key_size = priv->rss_key_size;
+		memcpy(rxfh->key, rss_config->hash_key, priv->rss_key_size);
+	}
+
+	if (rxfh->indir) {
+		rxfh->indir_size = priv->rss_lut_size;
+		memcpy(rxfh->indir, rss_config->hash_lut,
+		       priv->rss_lut_size * sizeof(*rxfh->indir));
+	}
+}
+
+static int gve_get_rxfh(struct net_device *netdev, struct ethtool_rxfh_param *rxfh)
+{
+	struct gve_priv *priv = netdev_priv(netdev);
+
+	if (!priv->rss_key_size || !priv->rss_lut_size)
+		return -EOPNOTSUPP;
+
+	if (priv->cache_rss_config) {
+		gve_get_rss_config_cache(priv, rxfh);
+		return 0;
+	}
+
+	return gve_adminq_query_rss_config(priv, rxfh);
+}
+
+static void gve_set_rss_config_cache(struct gve_priv *priv,
+				     struct ethtool_rxfh_param *rxfh)
+{
+	struct gve_rss_config *rss_config = &priv->rss_config;
+
+	if (rxfh->key)
+		memcpy(rss_config->hash_key, rxfh->key, priv->rss_key_size);
+
+	if (rxfh->indir)
+		memcpy(rss_config->hash_lut, rxfh->indir,
+		       priv->rss_lut_size * sizeof(*rxfh->indir));
+}
+
+static int gve_set_rxfh(struct net_device *netdev, struct ethtool_rxfh_param *rxfh,
+			struct netlink_ext_ack *extack)
+{
+	struct gve_priv *priv = netdev_priv(netdev);
+	int err;
+
+	if (!priv->rss_key_size || !priv->rss_lut_size)
+		return -EOPNOTSUPP;
+
+	err = gve_adminq_configure_rss(priv, rxfh);
+	if (err) {
+		NL_SET_ERR_MSG_MOD(extack, "Fail to configure RSS config");
+		return err;
+	}
+
+	if (priv->cache_rss_config)
+		gve_set_rss_config_cache(priv, rxfh);
+
+	return 0;
+}
+
 const struct ethtool_ops gve_ethtool_ops = {
 	.supported_coalesce_params = ETHTOOL_COALESCE_USECS,
 	.supported_ring_params = ETHTOOL_RING_USE_TCP_DATA_SPLIT,
@@ -783,6 +939,12 @@ const struct ethtool_ops gve_ethtool_ops = {
 	.get_msglevel = gve_get_msglevel,
 	.set_channels = gve_set_channels,
 	.get_channels = gve_get_channels,
+	.set_rxnfc = gve_set_rxnfc,
+	.get_rxnfc = gve_get_rxnfc,
+	.get_rxfh_indir_size = gve_get_rxfh_indir_size,
+	.get_rxfh_key_size = gve_get_rxfh_key_size,
+	.get_rxfh = gve_get_rxfh,
+	.set_rxfh = gve_set_rxfh,
 	.get_link = ethtool_op_get_link,
 	.get_coalesce = gve_get_coalesce,
 	.set_coalesce = gve_set_coalesce,

@@ -177,7 +177,8 @@ static int sr9700_get_eeprom(struct net_device *netdev,
 static int sr_mdio_read(struct net_device *netdev, int phy_id, int loc)
 {
 	struct usbnet *dev = netdev_priv(netdev);
-	__le16 res;
+	int err, res;
+	__le16 word;
 	int rc = 0;
 
 	if (phy_id) {
@@ -189,15 +190,21 @@ static int sr_mdio_read(struct net_device *netdev, int phy_id, int loc)
 	if (loc == MII_BMSR) {
 		u8 value;
 
-		sr_read_reg(dev, SR_NSR, &value);
+		err = sr_read_reg(dev, SR_NSR, &value);
+		if (err < 0)
+			return err;
+
 		if (value & NSR_LINKST)
 			rc = 1;
 	}
-	sr_share_read_word(dev, 1, loc, &res);
+	err = sr_share_read_word(dev, 1, loc, &word);
+	if (err < 0)
+		return err;
+
 	if (rc == 1)
-		res = le16_to_cpu(res) | BMSR_LSTATUS;
+		res = le16_to_cpu(word) | BMSR_LSTATUS;
 	else
-		res = le16_to_cpu(res) & ~BMSR_LSTATUS;
+		res = le16_to_cpu(word) & ~BMSR_LSTATUS;
 
 	netdev_dbg(netdev, "sr_mdio_read() phy_id=0x%02x, loc=0x%02x, returns=0x%04x\n",
 		   phy_id, loc, res);

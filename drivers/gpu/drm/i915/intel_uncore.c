@@ -24,17 +24,23 @@
 #include <drm/drm_managed.h>
 #include <linux/pm_runtime.h>
 
+#include "gt/intel_gt.h"
 #include "gt/intel_engine_regs.h"
 #include "gt/intel_gt_regs.h"
 
 #include "i915_drv.h"
 #include "i915_iosf_mbi.h"
 #include "i915_reg.h"
-#include "i915_trace.h"
 #include "i915_vgpu.h"
+#include "intel_uncore_trace.h"
 
 #define FORCEWAKE_ACK_TIMEOUT_MS 50
 #define GT_FIFO_TIMEOUT_MS	 10
+
+struct intel_uncore *to_intel_uncore(struct drm_device *drm)
+{
+	return &to_i915(drm)->uncore;
+}
 
 #define __raw_posting_read(...) ((void)__raw_uncore_read32(__VA_ARGS__))
 
@@ -180,14 +186,16 @@ fw_domain_wait_ack_clear(const struct intel_uncore_forcewake_domain *d)
 	if (!wait_ack_clear(d, FORCEWAKE_KERNEL))
 		return;
 
-	if (fw_ack(d) == ~0)
+	if (fw_ack(d) == ~0) {
 		drm_err(&d->uncore->i915->drm,
 			"%s: MMIO unreliable (forcewake register returns 0xFFFFFFFF)!\n",
 			intel_uncore_forcewake_domain_to_str(d->id));
-	else
+		intel_gt_set_wedged_async(d->uncore->gt);
+	} else {
 		drm_err(&d->uncore->i915->drm,
 			"%s: timed out waiting for forcewake ack to clear.\n",
 			intel_uncore_forcewake_domain_to_str(d->id));
+	}
 
 	add_taint_for_CI(d->uncore->i915, TAINT_WARN); /* CI now unreliable */
 }
@@ -2095,8 +2103,7 @@ static int __fw_domain_init(struct intel_uncore *uncore,
 
 	d->mask = BIT(domain_id);
 
-	hrtimer_init(&d->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	d->timer.function = intel_uncore_fw_release_timer;
+	hrtimer_setup(&d->timer, intel_uncore_fw_release_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 
 	uncore->fw_domains |= BIT(domain_id);
 
@@ -2469,7 +2476,7 @@ static int sanity_check_mmio_access(struct intel_uncore *uncore)
 
 	/*
 	 * Sanitycheck that MMIO access to the device is working properly.  If
-	 * the CPU is unable to communcate with a PCI device, BAR reads will
+	 * the CPU is unable to communicate with a PCI device, BAR reads will
 	 * return 0xFFFFFFFF.  Let's make sure the device isn't in this state
 	 * before we start trying to access registers.
 	 *
@@ -2614,10 +2621,17 @@ void intel_uncore_prune_engine_fw_domains(struct intel_uncore *uncore,
 static void driver_initiated_flr(struct intel_uncore *uncore)
 {
 	struct drm_i915_private *i915 = uncore->i915;
-	const unsigned int flr_timeout_ms = 3000; /* specs recommend a 3s wait */
+	unsigned int flr_timeout_ms;
 	int ret;
 
 	drm_dbg(&i915->drm, "Triggering Driver-FLR\n");
+
+	/*
+	 * The specification recommends a 3 seconds FLR reset timeout. To be
+	 * cautious, we will extend this to 9 seconds, three times the specified
+	 * timeout.
+	 */
+	flr_timeout_ms = 9000;
 
 	/*
 	 * Make sure any pending FLR requests have cleared by waiting for the

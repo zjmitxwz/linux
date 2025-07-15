@@ -631,7 +631,8 @@ free_skb:
 	return ret;
 }
 
-int mt76_dma_rx_fill(struct mt76_dev *dev, struct mt76_queue *q,
+static int
+mt76_dma_rx_fill_buf(struct mt76_dev *dev, struct mt76_queue *q,
 		     bool allow_direct)
 {
 	int len = SKB_WITH_OVERHEAD(q->buf_size);
@@ -639,8 +640,6 @@ int mt76_dma_rx_fill(struct mt76_dev *dev, struct mt76_queue *q,
 
 	if (!q->ndesc)
 		return 0;
-
-	spin_lock_bh(&q->lock);
 
 	while (q->queued < q->ndesc - 1) {
 		struct mt76_queue_buf qbuf = {};
@@ -674,6 +673,19 @@ done:
 	if (frames || mt76_queue_is_wed_rx(q))
 		mt76_dma_kick_queue(dev, q);
 
+	return frames;
+}
+
+int mt76_dma_rx_fill(struct mt76_dev *dev, struct mt76_queue *q,
+		     bool allow_direct)
+{
+	int frames;
+
+	if (!q->ndesc)
+		return 0;
+
+	spin_lock_bh(&q->lock);
+	frames = mt76_dma_rx_fill_buf(dev, q, allow_direct);
 	spin_unlock_bh(&q->lock);
 
 	return frames;
@@ -796,7 +808,7 @@ mt76_dma_rx_reset(struct mt76_dev *dev, enum mt76_rxq_id qid)
 		return;
 
 	mt76_dma_sync_idx(dev, q);
-	mt76_dma_rx_fill(dev, q, false);
+	mt76_dma_rx_fill_buf(dev, q, false);
 }
 
 static void
@@ -916,7 +928,7 @@ int mt76_dma_rx_poll(struct napi_struct *napi, int budget)
 	struct mt76_dev *dev;
 	int qid, done = 0, cur;
 
-	dev = container_of(napi->dev, struct mt76_dev, napi_dev);
+	dev = mt76_priv(napi->dev);
 	qid = napi - dev->napi;
 
 	rcu_read_lock();
@@ -940,19 +952,36 @@ static int
 mt76_dma_init(struct mt76_dev *dev,
 	      int (*poll)(struct napi_struct *napi, int budget))
 {
+	struct mt76_dev **priv;
 	int i;
 
-	init_dummy_netdev(&dev->napi_dev);
-	init_dummy_netdev(&dev->tx_napi_dev);
-	snprintf(dev->napi_dev.name, sizeof(dev->napi_dev.name), "%s",
+	dev->napi_dev = alloc_netdev_dummy(sizeof(struct mt76_dev *));
+	if (!dev->napi_dev)
+		return -ENOMEM;
+
+	/* napi_dev private data points to mt76_dev parent, so, mt76_dev
+	 * can be retrieved given napi_dev
+	 */
+	priv = netdev_priv(dev->napi_dev);
+	*priv = dev;
+
+	dev->tx_napi_dev = alloc_netdev_dummy(sizeof(struct mt76_dev *));
+	if (!dev->tx_napi_dev) {
+		free_netdev(dev->napi_dev);
+		return -ENOMEM;
+	}
+	priv = netdev_priv(dev->tx_napi_dev);
+	*priv = dev;
+
+	snprintf(dev->napi_dev->name, sizeof(dev->napi_dev->name), "%s",
 		 wiphy_name(dev->hw->wiphy));
-	dev->napi_dev.threaded = 1;
+	dev->napi_dev->threaded = 1;
 	init_completion(&dev->mmio.wed_reset);
 	init_completion(&dev->mmio.wed_reset_complete);
 
 	mt76_for_each_q_rx(dev, i) {
-		netif_napi_add(&dev->napi_dev, &dev->napi[i], poll);
-		mt76_dma_rx_fill(dev, &dev->q_rx[i], false);
+		netif_napi_add(dev->napi_dev, &dev->napi[i], poll);
+		mt76_dma_rx_fill_buf(dev, &dev->q_rx[i], false);
 		napi_enable(&dev->napi[i]);
 	}
 
@@ -982,6 +1011,7 @@ void mt76_dma_cleanup(struct mt76_dev *dev)
 	int i;
 
 	mt76_worker_disable(&dev->tx_worker);
+	napi_disable(&dev->tx_napi);
 	netif_napi_del(&dev->tx_napi);
 
 	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
@@ -1019,5 +1049,7 @@ void mt76_dma_cleanup(struct mt76_dev *dev)
 
 	mt76_free_pending_txwi(dev);
 	mt76_free_pending_rxwi(dev);
+	free_netdev(dev->napi_dev);
+	free_netdev(dev->tx_napi_dev);
 }
 EXPORT_SYMBOL_GPL(mt76_dma_cleanup);

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * random utiility code, for bcache but in theory not specific to bcache
+ * random utility code, for bcache but in theory not specific to bcache
  *
  * Copyright 2010, 2011 Kent Overstreet <kent.overstreet@gmail.com>
  * Copyright 2012 Google, Inc.
@@ -64,7 +64,7 @@ static int bch2_pow(u64 n, u64 p, u64 *res)
 	*res = 1;
 
 	while (p--) {
-		if (*res > div_u64(U64_MAX, n))
+		if (*res > div64_u64(U64_MAX, n))
 			return -ERANGE;
 		*res *= n;
 	}
@@ -140,14 +140,14 @@ static int __bch2_strtou64_h(const char *cp, u64 *res)
 
 	parse_or_ret(cp, parse_unit_suffix(cp, &b));
 
-	if (v > div_u64(U64_MAX, b))
+	if (v > div64_u64(U64_MAX, b))
 		return -ERANGE;
 	v *= b;
 
-	if (f_n > div_u64(U64_MAX, b))
+	if (f_n > div64_u64(U64_MAX, b))
 		return -ERANGE;
 
-	f_n = div_u64(f_n * b, f_d);
+	f_n = div64_u64(f_n * b, f_d);
 	if (v + f_n < v)
 		return -ERANGE;
 	v += f_n;
@@ -204,7 +204,7 @@ STRTO_H(strtoll, long long)
 STRTO_H(strtoull, unsigned long long)
 STRTO_H(strtou64, u64)
 
-u64 bch2_read_flag_list(char *opt, const char * const list[])
+u64 bch2_read_flag_list(const char *opt, const char * const list[])
 {
 	u64 ret = 0;
 	char *p, *s, *d = kstrdup(opt, GFP_KERNEL);
@@ -214,7 +214,7 @@ u64 bch2_read_flag_list(char *opt, const char * const list[])
 
 	s = strim(d);
 
-	while ((p = strsep(&s, ","))) {
+	while ((p = strsep(&s, ",;"))) {
 		int flag = match_string(list, -1, p);
 
 		if (flag < 0) {
@@ -222,7 +222,7 @@ u64 bch2_read_flag_list(char *opt, const char * const list[])
 			break;
 		}
 
-		ret |= 1 << flag;
+		ret |= BIT_ULL(flag);
 	}
 
 	kfree(d);
@@ -252,8 +252,19 @@ void bch2_prt_u64_base2(struct printbuf *out, u64 v)
 	bch2_prt_u64_base2_nbits(out, v, fls64(v) ?: 1);
 }
 
+static bool string_is_spaces(const char *str)
+{
+	while (*str) {
+		if (*str != ' ')
+			return false;
+		str++;
+	}
+	return true;
+}
+
 void bch2_print_string_as_lines(const char *prefix, const char *lines)
 {
+	bool locked = false;
 	const char *p;
 
 	if (!lines) {
@@ -261,15 +272,20 @@ void bch2_print_string_as_lines(const char *prefix, const char *lines)
 		return;
 	}
 
-	console_lock();
-	while (1) {
+	locked = console_trylock();
+
+	while (*lines) {
 		p = strchrnul(lines, '\n');
+		if (!*p && string_is_spaces(lines))
+			break;
+
 		printk("%s%.*s\n", prefix, (int) (p - lines), lines);
 		if (!*p)
 			break;
 		lines = p + 1;
 	}
-	console_unlock();
+	if (locked)
+		console_unlock();
 }
 
 int bch2_save_backtrace(bch_stacktrace *stack, struct task_struct *task, unsigned skipnr,
@@ -341,7 +357,7 @@ void bch2_pr_time_units(struct printbuf *out, u64 ns)
 {
 	const struct time_unit *u = bch2_pick_time_units(ns);
 
-	prt_printf(out, "%llu %s", div_u64(ns, u->nsecs), u->name);
+	prt_printf(out, "%llu %s", div64_u64(ns, u->nsecs), u->name);
 }
 
 static void bch2_pr_time_units_aligned(struct printbuf *out, u64 ns)
@@ -397,7 +413,6 @@ void bch2_time_stats_to_text(struct printbuf *out, struct bch2_time_stats *stats
 	printbuf_tabstop_push(out, TABSTOP_SIZE + 2);
 
 	prt_printf(out, "\tsince mount\r\trecent\r\n");
-	prt_printf(out, "recent");
 
 	printbuf_tabstops_reset(out);
 	printbuf_tabstop_push(out, out->indent + 20);
@@ -455,11 +470,11 @@ void bch2_time_stats_to_text(struct printbuf *out, struct bch2_time_stats *stats
 		u64 last_q = 0;
 
 		prt_printf(out, "quantiles (%s):\t", u->name);
-		eytzinger0_for_each(i, NR_QUANTILES) {
-			bool is_last = eytzinger0_next(i, NR_QUANTILES) == -1;
+		eytzinger0_for_each(j, NR_QUANTILES) {
+			bool is_last = eytzinger0_next(j, NR_QUANTILES) == -1;
 
-			u64 q = max(quantiles->entries[i].m, last_q);
-			prt_printf(out, "%llu ", div_u64(q, u->nsecs));
+			u64 q = max(quantiles->entries[j].m, last_q);
+			prt_printf(out, "%llu ", div64_u64(q, u->nsecs));
 			if (is_last)
 				prt_newline(out);
 			last_q = q;
@@ -635,19 +650,25 @@ int bch2_bio_alloc_pages(struct bio *bio, size_t size, gfp_t gfp_mask)
 	return 0;
 }
 
-size_t bch2_rand_range(size_t max)
+u64 bch2_get_random_u64_below(u64 ceil)
 {
-	size_t rand;
+	if (ceil <= U32_MAX)
+		return __get_random_u32_below(ceil);
 
-	if (!max)
-		return 0;
+	/* this is the same (clever) algorithm as in __get_random_u32_below() */
+	u64 rand = get_random_u64();
+	u64 mult = ceil * rand;
 
-	do {
-		rand = get_random_long();
-		rand &= roundup_pow_of_two(max) - 1;
-	} while (rand >= max);
+	if (unlikely(mult < ceil)) {
+		u64 bound;
+		div64_u64_rem(-ceil, ceil, &bound);
+		while (unlikely(mult < bound)) {
+			rand = get_random_u64();
+			mult = ceil * rand;
+		}
+	}
 
-	return rand;
+	return mul_u64_u64_shr(ceil, rand, 64);
 }
 
 void memcpy_to_bio(struct bio *dst, struct bvec_iter dst_iter, const void *src)
@@ -680,12 +701,43 @@ void memcpy_from_bio(void *dst, struct bio *src, struct bvec_iter src_iter)
 	}
 }
 
+#ifdef CONFIG_BCACHEFS_DEBUG
+void bch2_corrupt_bio(struct bio *bio)
+{
+	struct bvec_iter iter;
+	struct bio_vec bv;
+	unsigned offset = get_random_u32_below(bio->bi_iter.bi_size / sizeof(u64));
+
+	bio_for_each_segment(bv, bio, iter) {
+		unsigned u64s = bv.bv_len / sizeof(u64);
+
+		if (offset < u64s) {
+			u64 *segment = bvec_kmap_local(&bv);
+			segment[offset] = get_random_u64();
+			kunmap_local(segment);
+			return;
+		}
+		offset -= u64s;
+	}
+}
+#endif
+
+void bch2_bio_to_text(struct printbuf *out, struct bio *bio)
+{
+	prt_printf(out, "bi_remaining:\t%u\n",
+		   atomic_read(&bio->__bi_remaining));
+	prt_printf(out, "bi_end_io:\t%ps\n",
+		   bio->bi_end_io);
+	prt_printf(out, "bi_status:\t%u\n",
+		   bio->bi_status);
+}
+
 #if 0
 void eytzinger1_test(void)
 {
-	unsigned inorder, eytz, size;
+	unsigned inorder, size;
 
-	pr_info("1 based eytzinger test:");
+	pr_info("1 based eytzinger test:\n");
 
 	for (size = 2;
 	     size < 65536;
@@ -693,13 +745,7 @@ void eytzinger1_test(void)
 		unsigned extra = eytzinger1_extra(size);
 
 		if (!(size % 4096))
-			pr_info("tree size %u", size);
-
-		BUG_ON(eytzinger1_prev(0, size) != eytzinger1_last(size));
-		BUG_ON(eytzinger1_next(0, size) != eytzinger1_first(size));
-
-		BUG_ON(eytzinger1_prev(eytzinger1_first(size), size)	!= 0);
-		BUG_ON(eytzinger1_next(eytzinger1_last(size), size)	!= 0);
+			pr_info("tree size %u\n", size);
 
 		inorder = 1;
 		eytzinger1_for_each(eytz, size) {
@@ -710,15 +756,16 @@ void eytzinger1_test(void)
 
 			inorder++;
 		}
+		BUG_ON(inorder - 1 != size);
 	}
 }
 
 void eytzinger0_test(void)
 {
 
-	unsigned inorder, eytz, size;
+	unsigned inorder, size;
 
-	pr_info("0 based eytzinger test:");
+	pr_info("0 based eytzinger test:\n");
 
 	for (size = 1;
 	     size < 65536;
@@ -726,13 +773,7 @@ void eytzinger0_test(void)
 		unsigned extra = eytzinger0_extra(size);
 
 		if (!(size % 4096))
-			pr_info("tree size %u", size);
-
-		BUG_ON(eytzinger0_prev(-1, size) != eytzinger0_last(size));
-		BUG_ON(eytzinger0_next(-1, size) != eytzinger0_first(size));
-
-		BUG_ON(eytzinger0_prev(eytzinger0_first(size), size)	!= -1);
-		BUG_ON(eytzinger0_next(eytzinger0_last(size), size)	!= -1);
+			pr_info("tree size %u\n", size);
 
 		inorder = 0;
 		eytzinger0_for_each(eytz, size) {
@@ -743,37 +784,171 @@ void eytzinger0_test(void)
 
 			inorder++;
 		}
+		BUG_ON(inorder != size);
+
+		inorder = size - 1;
+		eytzinger0_for_each_prev(eytz, size) {
+			BUG_ON(eytz != eytzinger0_first(size) &&
+			       eytzinger0_next(eytzinger0_prev(eytz, size), size) != eytz);
+
+			inorder--;
+		}
+		BUG_ON(inorder != -1);
 	}
 }
 
-static inline int cmp_u16(const void *_l, const void *_r, size_t size)
+static inline int cmp_u16(const void *_l, const void *_r)
 {
 	const u16 *l = _l, *r = _r;
 
-	return (*l > *r) - (*r - *l);
+	return (*l > *r) - (*r > *l);
 }
 
-static void eytzinger0_find_test_val(u16 *test_array, unsigned nr, u16 search)
+static void eytzinger0_find_test_le(u16 *test_array, unsigned nr, u16 search)
 {
-	int i, c1 = -1, c2 = -1;
-	ssize_t r;
+	int r, s;
+	bool bad;
 
 	r = eytzinger0_find_le(test_array, nr,
 			       sizeof(test_array[0]),
 			       cmp_u16, &search);
-	if (r >= 0)
-		c1 = test_array[r];
-
-	for (i = 0; i < nr; i++)
-		if (test_array[i] <= search && test_array[i] > c2)
-			c2 = test_array[i];
-
-	if (c1 != c2) {
-		eytzinger0_for_each(i, nr)
-			pr_info("[%3u] = %12u", i, test_array[i]);
-		pr_info("find_le(%2u) -> [%2zi] = %2i should be %2i",
-			i, r, c1, c2);
+	if (r >= 0) {
+		if (test_array[r] > search) {
+			bad = true;
+		} else {
+			s = eytzinger0_next(r, nr);
+			bad = s >= 0 && test_array[s] <= search;
+		}
+	} else {
+		s = eytzinger0_last(nr);
+		bad = s >= 0 && test_array[s] <= search;
 	}
+
+	if (bad) {
+		s = -1;
+		eytzinger0_for_each_prev(j, nr) {
+			if (test_array[j] <= search) {
+				s = j;
+				break;
+			}
+		}
+
+		eytzinger0_for_each(j, nr)
+			pr_info("[%3u] = %12u\n", j, test_array[j]);
+		pr_info("find_le(%12u) = %3i should be %3i\n",
+			search, r, s);
+		BUG();
+	}
+}
+
+static void eytzinger0_find_test_gt(u16 *test_array, unsigned nr, u16 search)
+{
+	int r, s;
+	bool bad;
+
+	r = eytzinger0_find_gt(test_array, nr,
+			       sizeof(test_array[0]),
+			       cmp_u16, &search);
+	if (r >= 0) {
+		if (test_array[r] <= search) {
+			bad = true;
+		} else {
+			s = eytzinger0_prev(r, nr);
+			bad = s >= 0 && test_array[s] > search;
+		}
+	} else {
+		s = eytzinger0_first(nr);
+		bad = s >= 0 && test_array[s] > search;
+	}
+
+	if (bad) {
+		s = -1;
+		eytzinger0_for_each(j, nr) {
+			if (test_array[j] > search) {
+				s = j;
+				break;
+			}
+		}
+
+		eytzinger0_for_each(j, nr)
+			pr_info("[%3u] = %12u\n", j, test_array[j]);
+		pr_info("find_gt(%12u) = %3i should be %3i\n",
+			search, r, s);
+		BUG();
+	}
+}
+
+static void eytzinger0_find_test_ge(u16 *test_array, unsigned nr, u16 search)
+{
+	int r, s;
+	bool bad;
+
+	r = eytzinger0_find_ge(test_array, nr,
+			       sizeof(test_array[0]),
+			       cmp_u16, &search);
+	if (r >= 0) {
+		if (test_array[r] < search) {
+			bad = true;
+		} else {
+			s = eytzinger0_prev(r, nr);
+			bad = s >= 0 && test_array[s] >= search;
+		}
+	} else {
+		s = eytzinger0_first(nr);
+		bad = s >= 0 && test_array[s] >= search;
+	}
+
+	if (bad) {
+		s = -1;
+		eytzinger0_for_each(j, nr) {
+			if (test_array[j] >= search) {
+				s = j;
+				break;
+			}
+		}
+
+		eytzinger0_for_each(j, nr)
+			pr_info("[%3u] = %12u\n", j, test_array[j]);
+		pr_info("find_ge(%12u) = %3i should be %3i\n",
+			search, r, s);
+		BUG();
+	}
+}
+
+static void eytzinger0_find_test_eq(u16 *test_array, unsigned nr, u16 search)
+{
+	unsigned r;
+	int s;
+	bool bad;
+
+	r = eytzinger0_find(test_array, nr,
+			    sizeof(test_array[0]),
+			    cmp_u16, &search);
+
+	if (r < nr) {
+		bad = test_array[r] != search;
+	} else {
+		s = eytzinger0_find_le(test_array, nr,
+				       sizeof(test_array[0]),
+				       cmp_u16, &search);
+		bad = s >= 0 && test_array[s] == search;
+	}
+
+	if (bad) {
+		eytzinger0_for_each(j, nr)
+			pr_info("[%3u] = %12u\n", j, test_array[j]);
+		pr_info("find(%12u) = %3i is incorrect\n",
+			search, r);
+		BUG();
+	}
+}
+
+static void eytzinger0_find_test_val(u16 *test_array, unsigned nr, u16 search)
+{
+	eytzinger0_find_test_le(test_array, nr, search);
+	eytzinger0_find_test_gt(test_array, nr, search);
+	eytzinger0_find_test_ge(test_array, nr, search);
+	eytzinger0_find_test_eq(test_array, nr, search);
 }
 
 void eytzinger0_find_test(void)
@@ -782,15 +957,18 @@ void eytzinger0_find_test(void)
 	u16 *test_array = kmalloc_array(allocated, sizeof(test_array[0]), GFP_KERNEL);
 
 	for (nr = 1; nr < allocated; nr++) {
-		pr_info("testing %u elems", nr);
+		u16 prev = 0;
+
+		pr_info("testing %u elems\n", nr);
 
 		get_random_bytes(test_array, nr * sizeof(test_array[0]));
 		eytzinger0_sort(test_array, nr, sizeof(test_array[0]), cmp_u16, NULL);
 
 		/* verify array is sorted correctly: */
-		eytzinger0_for_each(i, nr)
-			BUG_ON(i != eytzinger0_last(nr) &&
-			       test_array[i] > test_array[eytzinger0_next(i, nr)]);
+		eytzinger0_for_each(j, nr) {
+			BUG_ON(test_array[j] < prev);
+			prev = test_array[j];
+		}
 
 		for (i = 0; i < U16_MAX; i += 1 << 12)
 			eytzinger0_find_test_val(test_array, nr, i);
@@ -832,14 +1010,14 @@ u64 *bch2_acc_percpu_u64s(u64 __percpu *p, unsigned nr)
 	return ret;
 }
 
-void bch2_darray_str_exit(darray_str *d)
+void bch2_darray_str_exit(darray_const_str *d)
 {
 	darray_for_each(*d, i)
 		kfree(*i);
 	darray_exit(d);
 }
 
-int bch2_split_devs(const char *_dev_name, darray_str *ret)
+int bch2_split_devs(const char *_dev_name, darray_const_str *ret)
 {
 	darray_init(ret);
 

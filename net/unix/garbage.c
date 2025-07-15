@@ -63,23 +63,32 @@
  *		wrt receive and holding up unrelated socket operations.
  */
 
-#include <linux/kernel.h>
-#include <linux/string.h>
-#include <linux/socket.h>
-#include <linux/un.h>
-#include <linux/net.h>
 #include <linux/fs.h>
+#include <linux/list.h>
 #include <linux/skbuff.h>
-#include <linux/netdevice.h>
-#include <linux/file.h>
-#include <linux/proc_fs.h>
-#include <linux/mutex.h>
-#include <linux/wait.h>
-
-#include <net/sock.h>
+#include <linux/socket.h>
+#include <linux/workqueue.h>
 #include <net/af_unix.h>
 #include <net/scm.h>
 #include <net/tcp_states.h>
+
+#include "af_unix.h"
+
+struct unix_vertex {
+	struct list_head edges;
+	struct list_head entry;
+	struct list_head scc_entry;
+	unsigned long out_degree;
+	unsigned long index;
+	unsigned long scc_index;
+};
+
+struct unix_edge {
+	struct unix_sock *predecessor;
+	struct unix_sock *successor;
+	struct list_head vertex_entry;
+	struct list_head stack_entry;
+};
 
 struct unix_sock *unix_get_socket(struct file *filp)
 {
@@ -337,23 +346,6 @@ static bool unix_vertex_dead(struct unix_vertex *vertex)
 	return true;
 }
 
-enum unix_recv_queue_lock_class {
-	U_RECVQ_LOCK_NORMAL,
-	U_RECVQ_LOCK_EMBRYO,
-};
-
-static void unix_collect_queue(struct unix_sock *u, struct sk_buff_head *hitlist)
-{
-	skb_queue_splice_init(&u->sk.sk_receive_queue, hitlist);
-
-#if IS_ENABLED(CONFIG_AF_UNIX_OOB)
-	if (u->oob_skb) {
-		WARN_ON_ONCE(skb_unref(u->oob_skb));
-		u->oob_skb = NULL;
-	}
-#endif
-}
-
 static void unix_collect_skb(struct list_head *scc, struct sk_buff_head *hitlist)
 {
 	struct unix_vertex *vertex;
@@ -375,13 +367,12 @@ static void unix_collect_skb(struct list_head *scc, struct sk_buff_head *hitlist
 			skb_queue_walk(queue, skb) {
 				struct sk_buff_head *embryo_queue = &skb->sk->sk_receive_queue;
 
-				/* listener -> embryo order, the inversion never happens. */
-				spin_lock_nested(&embryo_queue->lock, U_RECVQ_LOCK_EMBRYO);
-				unix_collect_queue(unix_sk(skb->sk), hitlist);
+				spin_lock(&embryo_queue->lock);
+				skb_queue_splice_init(embryo_queue, hitlist);
 				spin_unlock(&embryo_queue->lock);
 			}
 		} else {
-			unix_collect_queue(u, hitlist);
+			skb_queue_splice_init(queue, hitlist);
 		}
 
 		spin_unlock(&queue->lock);
@@ -476,6 +467,7 @@ prev_vertex:
 	}
 
 	if (vertex->index == vertex->scc_index) {
+		struct unix_vertex *v;
 		struct list_head scc;
 		bool scc_dead = true;
 
@@ -486,15 +478,15 @@ prev_vertex:
 		 */
 		__list_cut_position(&scc, &vertex_stack, &vertex->scc_entry);
 
-		list_for_each_entry_reverse(vertex, &scc, scc_entry) {
+		list_for_each_entry_reverse(v, &scc, scc_entry) {
 			/* Don't restart DFS from this vertex in unix_walk_scc(). */
-			list_move_tail(&vertex->entry, &unix_visited_vertices);
+			list_move_tail(&v->entry, &unix_visited_vertices);
 
 			/* Mark vertex as off-stack. */
-			vertex->index = unix_vertex_grouped_index;
+			v->index = unix_vertex_grouped_index;
 
 			if (scc_dead)
-				scc_dead = unix_vertex_dead(vertex);
+				scc_dead = unix_vertex_dead(v);
 		}
 
 		if (scc_dead)
@@ -590,7 +582,7 @@ static void __unix_gc(struct work_struct *work)
 			UNIXCB(skb).fp->dead = true;
 	}
 
-	__skb_queue_purge(&hitlist);
+	__skb_queue_purge_reason(&hitlist, SKB_DROP_REASON_SOCKET_CLOSE);
 skip_gc:
 	WRITE_ONCE(gc_in_progress, false);
 }

@@ -320,7 +320,11 @@ struct mipi_csis_device {
 	struct v4l2_subdev sd;
 	struct media_pad pads[CSIS_PADS_NUM];
 	struct v4l2_async_notifier notifier;
-	struct v4l2_subdev *src_sd;
+
+	struct {
+		struct v4l2_subdev *sd;
+		const struct media_pad *pad;
+	} source;
 
 	struct v4l2_mbus_config_mipi_csi2 bus;
 	u32 clk_frequency;
@@ -593,12 +597,13 @@ static void __mipi_csis_set_format(struct mipi_csis_device *csis,
 static int mipi_csis_calculate_params(struct mipi_csis_device *csis,
 				      const struct csis_pix_format *csis_fmt)
 {
+	struct media_pad *src_pad =
+		&csis->source.sd->entity.pads[csis->source.pad->index];
 	s64 link_freq;
 	u32 lane_rate;
 
 	/* Calculate the line rate from the pixel rate. */
-	link_freq = v4l2_get_link_freq(csis->src_sd->ctrl_handler,
-				       csis_fmt->width,
+	link_freq = v4l2_get_link_freq(src_pad, csis_fmt->width,
 				       csis->bus.num_data_lanes * 2);
 	if (link_freq < 0) {
 		dev_err(csis->dev, "Unable to obtain link frequency: %d\n",
@@ -857,18 +862,21 @@ static void mipi_csis_log_counters(struct mipi_csis_device *csis, bool non_error
 {
 	unsigned int num_events = non_errors ? MIPI_CSIS_NUM_EVENTS
 				: MIPI_CSIS_NUM_EVENTS - 8;
+	unsigned int counters[MIPI_CSIS_NUM_EVENTS];
 	unsigned long flags;
 	unsigned int i;
 
 	spin_lock_irqsave(&csis->slock, flags);
+	for (i = 0; i < num_events; ++i)
+		counters[i] =  csis->events[i].counter;
+	spin_unlock_irqrestore(&csis->slock, flags);
 
 	for (i = 0; i < num_events; ++i) {
-		if (csis->events[i].counter > 0 || csis->debug.enable)
+		if (counters[i] > 0 || csis->debug.enable)
 			dev_info(csis->dev, "%s events: %d\n",
 				 csis->events[i].name,
-				 csis->events[i].counter);
+				 counters[i]);
 	}
-	spin_unlock_irqrestore(&csis->slock, flags);
 }
 
 static int mipi_csis_dump_regs(struct mipi_csis_device *csis)
@@ -958,7 +966,8 @@ static int mipi_csis_s_stream(struct v4l2_subdev *sd, int enable)
 	int ret;
 
 	if (!enable) {
-		v4l2_subdev_call(csis->src_sd, video, s_stream, 0);
+		v4l2_subdev_disable_streams(csis->source.sd,
+					    csis->source.pad->index, BIT(0));
 
 		mipi_csis_stop_stream(csis);
 		if (csis->debug.enable)
@@ -986,7 +995,8 @@ static int mipi_csis_s_stream(struct v4l2_subdev *sd, int enable)
 
 	mipi_csis_start_stream(csis, format, csis_fmt);
 
-	ret = v4l2_subdev_call(csis->src_sd, video, s_stream, 1);
+	ret = v4l2_subdev_enable_streams(csis->source.sd,
+					 csis->source.pad->index, BIT(0));
 	if (ret < 0)
 		goto err_stop;
 
@@ -1233,12 +1243,14 @@ static int mipi_csis_link_setup(struct media_entity *entity,
 	remote_sd = media_entity_to_v4l2_subdev(remote_pad->entity);
 
 	if (flags & MEDIA_LNK_FL_ENABLED) {
-		if (csis->src_sd)
+		if (csis->source.sd)
 			return -EBUSY;
 
-		csis->src_sd = remote_sd;
+		csis->source.sd = remote_sd;
+		csis->source.pad = remote_pad;
 	} else {
-		csis->src_sd = NULL;
+		csis->source.sd = NULL;
+		csis->source.pad = NULL;
 	}
 
 	return 0;
@@ -1336,7 +1348,7 @@ err_parse:
  * Suspend/resume
  */
 
-static int __maybe_unused mipi_csis_runtime_suspend(struct device *dev)
+static int mipi_csis_runtime_suspend(struct device *dev)
 {
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct mipi_csis_device *csis = sd_to_mipi_csis_device(sd);
@@ -1351,7 +1363,7 @@ static int __maybe_unused mipi_csis_runtime_suspend(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused mipi_csis_runtime_resume(struct device *dev)
+static int mipi_csis_runtime_resume(struct device *dev)
 {
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct mipi_csis_device *csis = sd_to_mipi_csis_device(sd);
@@ -1371,8 +1383,8 @@ static int __maybe_unused mipi_csis_runtime_resume(struct device *dev)
 }
 
 static const struct dev_pm_ops mipi_csis_pm_ops = {
-	SET_RUNTIME_PM_OPS(mipi_csis_runtime_suspend, mipi_csis_runtime_resume,
-			   NULL)
+	RUNTIME_PM_OPS(mipi_csis_runtime_suspend, mipi_csis_runtime_resume,
+		       NULL)
 };
 
 /* -----------------------------------------------------------------------------
@@ -1559,11 +1571,11 @@ MODULE_DEVICE_TABLE(of, mipi_csis_of_match);
 
 static struct platform_driver mipi_csis_driver = {
 	.probe		= mipi_csis_probe,
-	.remove_new	= mipi_csis_remove,
+	.remove		= mipi_csis_remove,
 	.driver		= {
 		.of_match_table = mipi_csis_of_match,
 		.name		= CSIS_DRIVER_NAME,
-		.pm		= &mipi_csis_pm_ops,
+		.pm		= pm_ptr(&mipi_csis_pm_ops),
 	},
 };
 

@@ -64,6 +64,7 @@ static bool actions_may_change_flow(const struct nlattr *actions)
 		case OVS_ACTION_ATTR_TRUNC:
 		case OVS_ACTION_ATTR_USERSPACE:
 		case OVS_ACTION_ATTR_DROP:
+		case OVS_ACTION_ATTR_PSAMPLE:
 			break;
 
 		case OVS_ACTION_ATTR_CT:
@@ -1937,7 +1938,7 @@ int ovs_nla_get_identifier(struct sw_flow_id *sfid, const struct nlattr *ufid,
 
 u32 ovs_nla_get_ufid_flags(const struct nlattr *attr)
 {
-	return attr ? nla_get_u32(attr) : 0;
+	return nla_get_u32_default(attr, 0);
 }
 
 /**
@@ -2316,13 +2317,9 @@ int ovs_nla_put_mask(const struct sw_flow *flow, struct sk_buff *skb)
 				OVS_FLOW_ATTR_MASK, true, skb);
 }
 
-#define MAX_ACTIONS_BUFSIZE	(32 * 1024)
-
 static struct sw_flow_actions *nla_alloc_flow_actions(int size)
 {
 	struct sw_flow_actions *sfa;
-
-	WARN_ON_ONCE(size > MAX_ACTIONS_BUFSIZE);
 
 	sfa = kmalloc(kmalloc_size_roundup(sizeof(*sfa) + size), GFP_KERNEL);
 	if (!sfa)
@@ -2409,7 +2406,7 @@ static void ovs_nla_free_nested_actions(const struct nlattr *actions, int len)
 	/* Whenever new actions are added, the need to update this
 	 * function should be considered.
 	 */
-	BUILD_BUG_ON(OVS_ACTION_ATTR_MAX != 24);
+	BUILD_BUG_ON(OVS_ACTION_ATTR_MAX != 25);
 
 	if (!actions)
 		return;
@@ -2479,18 +2476,9 @@ static struct nlattr *reserve_sfa_size(struct sw_flow_actions **sfa,
 
 	new_acts_size = max(next_offset + req_size, ksize(*sfa) * 2);
 
-	if (new_acts_size > MAX_ACTIONS_BUFSIZE) {
-		if ((next_offset + req_size) > MAX_ACTIONS_BUFSIZE) {
-			OVS_NLERR(log, "Flow action size exceeds max %u",
-				  MAX_ACTIONS_BUFSIZE);
-			return ERR_PTR(-EMSGSIZE);
-		}
-		new_acts_size = MAX_ACTIONS_BUFSIZE;
-	}
-
 	acts = nla_alloc_flow_actions(new_acts_size);
 	if (IS_ERR(acts))
-		return (void *)acts;
+		return ERR_CAST(acts);
 
 	memcpy(acts->actions, (*sfa)->actions, (*sfa)->actions_len);
 	acts->actions_len = (*sfa)->actions_len;
@@ -2888,7 +2876,8 @@ static int validate_set(const struct nlattr *a,
 	size_t key_len;
 
 	/* There can be only one key in a action */
-	if (nla_total_size(nla_len(ovs_key)) != nla_len(a))
+	if (!nla_ok(ovs_key, nla_len(a)) ||
+	    nla_total_size(nla_len(ovs_key)) != nla_len(a))
 		return -EINVAL;
 
 	key_len = nla_len(ovs_key);
@@ -3060,7 +3049,8 @@ static int validate_userspace(const struct nlattr *attr)
 	struct nlattr *a[OVS_USERSPACE_ATTR_MAX + 1];
 	int error;
 
-	error = nla_parse_nested_deprecated(a, OVS_USERSPACE_ATTR_MAX, attr,
+	error = nla_parse_deprecated_strict(a, OVS_USERSPACE_ATTR_MAX,
+					    nla_data(attr), nla_len(attr),
 					    userspace_policy, NULL);
 	if (error)
 		return error;
@@ -3157,6 +3147,28 @@ static int validate_and_copy_check_pkt_len(struct net *net,
 	return 0;
 }
 
+static int validate_psample(const struct nlattr *attr)
+{
+	static const struct nla_policy policy[OVS_PSAMPLE_ATTR_MAX + 1] = {
+		[OVS_PSAMPLE_ATTR_GROUP] = { .type = NLA_U32 },
+		[OVS_PSAMPLE_ATTR_COOKIE] = {
+			.type = NLA_BINARY,
+			.len = OVS_PSAMPLE_COOKIE_MAX_SIZE,
+		},
+	};
+	struct nlattr *a[OVS_PSAMPLE_ATTR_MAX + 1];
+	int err;
+
+	if (!IS_ENABLED(CONFIG_PSAMPLE))
+		return -EOPNOTSUPP;
+
+	err = nla_parse_nested(a, OVS_PSAMPLE_ATTR_MAX, attr, policy, NULL);
+	if (err)
+		return err;
+
+	return a[OVS_PSAMPLE_ATTR_GROUP] ? 0 : -EINVAL;
+}
+
 static int copy_action(const struct nlattr *from,
 		       struct sw_flow_actions **sfa, bool log)
 {
@@ -3212,6 +3224,7 @@ static int __ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
 			[OVS_ACTION_ATTR_ADD_MPLS] = sizeof(struct ovs_action_add_mpls),
 			[OVS_ACTION_ATTR_DEC_TTL] = (u32)-1,
 			[OVS_ACTION_ATTR_DROP] = sizeof(u32),
+			[OVS_ACTION_ATTR_PSAMPLE] = (u32)-1,
 		};
 		const struct ovs_action_push_vlan *vlan;
 		int type = nla_type(a);
@@ -3490,6 +3503,12 @@ static int __ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
 				return -EINVAL;
 			break;
 
+		case OVS_ACTION_ATTR_PSAMPLE:
+			err = validate_psample(a);
+			if (err)
+				return err;
+			break;
+
 		default:
 			OVS_NLERR(log, "Unknown Action type %d", type);
 			return -EINVAL;
@@ -3515,7 +3534,7 @@ int ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
 	int err;
 	u32 mpls_label_count = 0;
 
-	*sfa = nla_alloc_flow_actions(min(nla_len(attr), MAX_ACTIONS_BUFSIZE));
+	*sfa = nla_alloc_flow_actions(nla_len(attr));
 	if (IS_ERR(*sfa))
 		return PTR_ERR(*sfa);
 

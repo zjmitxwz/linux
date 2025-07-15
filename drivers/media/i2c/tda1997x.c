@@ -2315,11 +2315,10 @@ static int tda1997x_parse_dt(struct tda1997x_state *state)
 		return -EINVAL;
 
 	ret = v4l2_fwnode_endpoint_parse(of_fwnode_handle(ep), &bus_cfg);
-	if (ret) {
-		of_node_put(ep);
-		return ret;
-	}
 	of_node_put(ep);
+	if (ret)
+		return ret;
+
 	pdata->vidout_bus_type = bus_cfg.bus_type;
 
 	/* polarity of HS/VS/DE */
@@ -2514,7 +2513,7 @@ static void tda1997x_codec_remove(struct snd_soc_component *component)
 {
 }
 
-static struct snd_soc_component_driver tda1997x_codec_driver = {
+static const struct snd_soc_component_driver tda1997x_codec_driver = {
 	.probe			= tda1997x_codec_probe,
 	.remove			= tda1997x_codec_remove,
 	.idle_bias_on		= 1,

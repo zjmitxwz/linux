@@ -17,6 +17,8 @@
 #include <linux/of_irq.h>
 #include <linux/syscore_ops.h>
 
+#include "irq-loongson.h"
+
 /* Registers */
 #define PCH_PIC_MASK		0x20
 #define PCH_PIC_HTMSI_EN	0x40
@@ -390,7 +392,7 @@ static int pch_pic_of_init(struct device_node *node,
 	}
 
 	err = pch_pic_init(res.start, resource_size(&res), vec_base,
-				parent_domain, of_node_to_fwnode(node), 0);
+				parent_domain, of_fwnode_handle(node), 0);
 	if (err < 0)
 		return err;
 

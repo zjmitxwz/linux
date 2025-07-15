@@ -2051,13 +2051,15 @@ TRACE_EVENT(fl_getdevinfo,
 
 DECLARE_EVENT_CLASS(nfs4_flexfiles_io_event,
 		TP_PROTO(
-			const struct nfs_pgio_header *hdr
+			const struct nfs_pgio_header *hdr,
+			int error
 		),
 
-		TP_ARGS(hdr),
+		TP_ARGS(hdr, error),
 
 		TP_STRUCT__entry(
 			__field(unsigned long, error)
+			__field(unsigned long, nfs_error)
 			__field(dev_t, dev)
 			__field(u32, fhandle)
 			__field(u64, fileid)
@@ -2073,7 +2075,8 @@ DECLARE_EVENT_CLASS(nfs4_flexfiles_io_event,
 		TP_fast_assign(
 			const struct inode *inode = hdr->inode;
 
-			__entry->error = hdr->res.op_status;
+			__entry->error = -error;
+			__entry->nfs_error = hdr->res.op_status;
 			__entry->fhandle = nfs_fhandle_hash(hdr->args.fh);
 			__entry->fileid = NFS_FILEID(inode);
 			__entry->dev = inode->i_sb->s_dev;
@@ -2088,7 +2091,8 @@ DECLARE_EVENT_CLASS(nfs4_flexfiles_io_event,
 
 		TP_printk(
 			"error=%ld (%s) fileid=%02x:%02x:%llu fhandle=0x%08x "
-			"offset=%llu count=%u stateid=%d:0x%08x dstaddr=%s",
+			"offset=%llu count=%u stateid=%d:0x%08x dstaddr=%s "
+			"nfs_error=%lu (%s)",
 			-__entry->error,
 			show_nfs4_status(__entry->error),
 			MAJOR(__entry->dev), MINOR(__entry->dev),
@@ -2096,28 +2100,32 @@ DECLARE_EVENT_CLASS(nfs4_flexfiles_io_event,
 			__entry->fhandle,
 			__entry->offset, __entry->count,
 			__entry->stateid_seq, __entry->stateid_hash,
-			__get_str(dstaddr)
+			__get_str(dstaddr), __entry->nfs_error,
+			show_nfs4_status(__entry->nfs_error)
 		)
 );
 
 #define DEFINE_NFS4_FLEXFILES_IO_EVENT(name) \
 	DEFINE_EVENT(nfs4_flexfiles_io_event, name, \
 			TP_PROTO( \
-				const struct nfs_pgio_header *hdr \
+				const struct nfs_pgio_header *hdr, \
+				int error \
 			), \
-			TP_ARGS(hdr))
+			TP_ARGS(hdr, error))
 DEFINE_NFS4_FLEXFILES_IO_EVENT(ff_layout_read_error);
 DEFINE_NFS4_FLEXFILES_IO_EVENT(ff_layout_write_error);
 
 TRACE_EVENT(ff_layout_commit_error,
 		TP_PROTO(
-			const struct nfs_commit_data *data
+			const struct nfs_commit_data *data,
+			int error
 		),
 
-		TP_ARGS(data),
+		TP_ARGS(data, error),
 
 		TP_STRUCT__entry(
 			__field(unsigned long, error)
+			__field(unsigned long, nfs_error)
 			__field(dev_t, dev)
 			__field(u32, fhandle)
 			__field(u64, fileid)
@@ -2131,7 +2139,8 @@ TRACE_EVENT(ff_layout_commit_error,
 		TP_fast_assign(
 			const struct inode *inode = data->inode;
 
-			__entry->error = data->res.op_status;
+			__entry->error = -error;
+			__entry->nfs_error = data->res.op_status;
 			__entry->fhandle = nfs_fhandle_hash(data->args.fh);
 			__entry->fileid = NFS_FILEID(inode);
 			__entry->dev = inode->i_sb->s_dev;
@@ -2142,16 +2151,105 @@ TRACE_EVENT(ff_layout_commit_error,
 
 		TP_printk(
 			"error=%ld (%s) fileid=%02x:%02x:%llu fhandle=0x%08x "
-			"offset=%llu count=%u dstaddr=%s",
+			"offset=%llu count=%u dstaddr=%s nfs_error=%lu (%s)",
 			-__entry->error,
 			show_nfs4_status(__entry->error),
 			MAJOR(__entry->dev), MINOR(__entry->dev),
 			(unsigned long long)__entry->fileid,
 			__entry->fhandle,
 			__entry->offset, __entry->count,
-			__get_str(dstaddr)
+			__get_str(dstaddr), __entry->nfs_error,
+			show_nfs4_status(__entry->nfs_error)
 		)
 );
+
+DECLARE_EVENT_CLASS(pnfs_bl_pr_key_class,
+	TP_PROTO(
+		const struct block_device *bdev,
+		u64 key
+	),
+	TP_ARGS(bdev, key),
+	TP_STRUCT__entry(
+		__field(u64, key)
+		__field(dev_t, dev)
+		__string(device, bdev->bd_disk->disk_name)
+	),
+	TP_fast_assign(
+		__entry->key = key;
+		__entry->dev = bdev->bd_dev;
+		__assign_str(device);
+	),
+	TP_printk("dev=%d,%d (%s) key=0x%016llx",
+		MAJOR(__entry->dev), MINOR(__entry->dev),
+		__get_str(device), __entry->key
+	)
+);
+
+#define DEFINE_NFS4_BLOCK_PRKEY_EVENT(name) \
+	DEFINE_EVENT(pnfs_bl_pr_key_class, name, \
+		TP_PROTO( \
+			const struct block_device *bdev, \
+			u64 key \
+		), \
+		TP_ARGS(bdev, key))
+DEFINE_NFS4_BLOCK_PRKEY_EVENT(bl_pr_key_reg);
+DEFINE_NFS4_BLOCK_PRKEY_EVENT(bl_pr_key_unreg);
+
+/*
+ * From uapi/linux/pr.h
+ */
+TRACE_DEFINE_ENUM(PR_STS_SUCCESS);
+TRACE_DEFINE_ENUM(PR_STS_IOERR);
+TRACE_DEFINE_ENUM(PR_STS_RESERVATION_CONFLICT);
+TRACE_DEFINE_ENUM(PR_STS_RETRY_PATH_FAILURE);
+TRACE_DEFINE_ENUM(PR_STS_PATH_FAST_FAILED);
+TRACE_DEFINE_ENUM(PR_STS_PATH_FAILED);
+
+#define show_pr_status(x) \
+	__print_symbolic(x, \
+		{ PR_STS_SUCCESS,		"SUCCESS" }, \
+		{ PR_STS_IOERR,			"IOERR" }, \
+		{ PR_STS_RESERVATION_CONFLICT,	"RESERVATION_CONFLICT" }, \
+		{ PR_STS_RETRY_PATH_FAILURE,	"RETRY_PATH_FAILURE" }, \
+		{ PR_STS_PATH_FAST_FAILED,	"PATH_FAST_FAILED" }, \
+		{ PR_STS_PATH_FAILED,		"PATH_FAILED" })
+
+DECLARE_EVENT_CLASS(pnfs_bl_pr_key_err_class,
+	TP_PROTO(
+		const struct block_device *bdev,
+		u64 key,
+		int status
+	),
+	TP_ARGS(bdev, key, status),
+	TP_STRUCT__entry(
+		__field(u64, key)
+		__field(dev_t, dev)
+		__field(unsigned long, status)
+		__string(device, bdev->bd_disk->disk_name)
+	),
+	TP_fast_assign(
+		__entry->key = key;
+		__entry->dev = bdev->bd_dev;
+		__entry->status = status;
+		__assign_str(device);
+	),
+	TP_printk("dev=%d,%d (%s) key=0x%016llx status=%s",
+		MAJOR(__entry->dev), MINOR(__entry->dev),
+		__get_str(device), __entry->key,
+		show_pr_status(__entry->status)
+	)
+);
+
+#define DEFINE_NFS4_BLOCK_PRKEY_ERR_EVENT(name) \
+	DEFINE_EVENT(pnfs_bl_pr_key_err_class, name, \
+		TP_PROTO( \
+			const struct block_device *bdev, \
+			u64 key, \
+			int status \
+		), \
+		TP_ARGS(bdev, key, status))
+DEFINE_NFS4_BLOCK_PRKEY_ERR_EVENT(bl_pr_key_reg_err);
+DEFINE_NFS4_BLOCK_PRKEY_ERR_EVENT(bl_pr_key_unreg_err);
 
 #ifdef CONFIG_NFS_V4_2
 TRACE_DEFINE_ENUM(NFS4_CONTENT_DATA);
@@ -2520,7 +2618,7 @@ TRACE_EVENT(nfs4_copy_notify,
 		)
 );
 
-TRACE_EVENT(nfs4_offload_cancel,
+DECLARE_EVENT_CLASS(nfs4_offload_class,
 		TP_PROTO(
 			const struct nfs42_offload_status_args *args,
 			int error
@@ -2552,6 +2650,15 @@ TRACE_EVENT(nfs4_offload_cancel,
 			__entry->stateid_seq, __entry->stateid_hash
 		)
 );
+#define DEFINE_NFS4_OFFLOAD_EVENT(name) \
+	DEFINE_EVENT(nfs4_offload_class, name,  \
+			TP_PROTO( \
+				const struct nfs42_offload_status_args *args, \
+				int error \
+			), \
+			TP_ARGS(args, error))
+DEFINE_NFS4_OFFLOAD_EVENT(nfs4_offload_cancel);
+DEFINE_NFS4_OFFLOAD_EVENT(nfs4_offload_status);
 
 DECLARE_EVENT_CLASS(nfs4_xattr_event,
 		TP_PROTO(

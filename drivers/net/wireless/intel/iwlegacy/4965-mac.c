@@ -1769,7 +1769,7 @@ il4965_tx_skb(struct il_priv *il,
 	/* Set up first empty entry in queue's array of Tx/cmd buffers */
 	out_cmd = txq->cmd[q->write_ptr];
 	out_meta = &txq->meta[q->write_ptr];
-	tx_cmd = &out_cmd->cmd.tx;
+	tx_cmd = container_of(&out_cmd->cmd.tx, struct il_tx_cmd, __hdr);
 	memset(&out_cmd->hdr, 0, sizeof(out_cmd->hdr));
 	memset(tx_cmd, 0, sizeof(struct il_tx_cmd));
 
@@ -4051,7 +4051,7 @@ il4965_hdl_alive(struct il_priv *il, struct il_rx_buf *rxb)
 static void
 il4965_bg_stats_periodic(struct timer_list *t)
 {
-	struct il_priv *il = from_timer(il, t, stats_periodic);
+	struct il_priv *il = timer_container_of(il, t, stats_periodic);
 
 	if (test_bit(S_EXIT_PENDING, &il->status))
 		return;
@@ -5350,7 +5350,7 @@ __il4965_down(struct il_priv *il)
 
 	/* Stop TX queues watchdog. We need to have S_EXIT_PENDING bit set
 	 * to prevent rearm timer */
-	del_timer_sync(&il->watchdog);
+	timer_delete_sync(&il->watchdog);
 
 	il_clear_ucode_stations(il);
 
@@ -5820,7 +5820,7 @@ out:
 }
 
 void
-il4965_mac_stop(struct ieee80211_hw *hw)
+il4965_mac_stop(struct ieee80211_hw *hw, bool suspend)
 {
 	struct il_priv *il = hw->priv;
 
@@ -6243,7 +6243,7 @@ il4965_cancel_deferred_work(struct il_priv *il)
 
 	il_cancel_scan_deferred_work(il);
 
-	del_timer_sync(&il->stats_periodic);
+	timer_delete_sync(&il->stats_periodic);
 }
 
 static void

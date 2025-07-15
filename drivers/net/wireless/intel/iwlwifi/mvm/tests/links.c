@@ -8,7 +8,7 @@
 #include "../mvm.h"
 #include <kunit/test.h>
 
-MODULE_IMPORT_NS(EXPORTED_FOR_KUNIT_TESTING);
+MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");
 
 static struct wiphy wiphy = {
 	.mtx = __MUTEX_INITIALIZER(wiphy.mtx),
@@ -208,6 +208,7 @@ static void setup_link_conf(struct kunit *test)
 	bss_load->channel_util = params->channel_util;
 
 	rcu_assign_pointer(bss.ies, ies);
+	rcu_assign_pointer(bss.beacon_ies, ies);
 }
 
 static void test_link_grading(struct kunit *test)
@@ -261,7 +262,7 @@ static const struct valid_link_pair_case {
 		.desc = "LB + HB, no BT.",
 		.chan_a = &chan_2ghz,
 		.chan_b = &chan_5ghz,
-		.valid = false,
+		.valid = true,
 	},
 	{
 		.desc = "LB + HB, with BT.",
@@ -393,9 +394,6 @@ static void test_valid_link_pair(struct kunit *test)
 	chandef_a.width = params->cw_a ?: NL80211_CHAN_WIDTH_20;
 	chandef_b.width = params->cw_b ?: NL80211_CHAN_WIDTH_20;
 
-#ifdef CONFIG_IWLWIFI_SUPPORT_DEBUG_OVERRIDES
-	trans->dbg_cfg = default_dbg_config;
-#endif
 	mvm.trans = trans;
 
 	mvm.last_bt_notif.wifi_loss_low_rssi = params->bt;

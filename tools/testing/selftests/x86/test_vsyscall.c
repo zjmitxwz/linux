@@ -97,11 +97,6 @@ static inline long sys_gtod(struct timeval *tv, struct timezone *tz)
 	return syscall(SYS_gettimeofday, tv, tz);
 }
 
-static inline int sys_clock_gettime(clockid_t id, struct timespec *ts)
-{
-	return syscall(SYS_clock_gettime, id, ts);
-}
-
 static inline long sys_time(time_t *t)
 {
 	return syscall(SYS_time, t);
@@ -252,7 +247,7 @@ static void test_getcpu(int cpu)
 
 	if (ret_sys == 0) {
 		if (cpu_sys != cpu)
-			ksft_print_msg("syscall reported CPU %hu but should be %d\n",
+			ksft_print_msg("syscall reported CPU %u but should be %d\n",
 				       cpu_sys, cpu);
 
 		have_node = true;
@@ -270,10 +265,10 @@ static void test_getcpu(int cpu)
 
 			if (cpu_vdso != cpu || node_vdso != node) {
 				if (cpu_vdso != cpu)
-					ksft_print_msg("vDSO reported CPU %hu but should be %d\n",
+					ksft_print_msg("vDSO reported CPU %u but should be %d\n",
 						       cpu_vdso, cpu);
 				if (node_vdso != node)
-					ksft_print_msg("vDSO reported node %hu but should be %hu\n",
+					ksft_print_msg("vDSO reported node %u but should be %u\n",
 						       node_vdso, node);
 				ksft_test_result_fail("Wrong values\n");
 			} else {
@@ -295,10 +290,10 @@ static void test_getcpu(int cpu)
 
 			if (cpu_vsys != cpu || node_vsys != node) {
 				if (cpu_vsys != cpu)
-					ksft_print_msg("vsyscall reported CPU %hu but should be %d\n",
+					ksft_print_msg("vsyscall reported CPU %u but should be %d\n",
 						       cpu_vsys, cpu);
 				if (node_vsys != node)
-					ksft_print_msg("vsyscall reported node %hu but should be %hu\n",
+					ksft_print_msg("vsyscall reported node %u but should be %u\n",
 						       node_vsys, node);
 				ksft_test_result_fail("Wrong values\n");
 			} else {
@@ -314,19 +309,6 @@ static void test_getcpu(int cpu)
 
 static jmp_buf jmpbuf;
 static volatile unsigned long segv_err;
-
-static void sethandler(int sig, void (*handler)(int, siginfo_t *, void *),
-		       int flags)
-{
-	struct sigaction sa;
-
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_sigaction = handler;
-	sa.sa_flags = SA_SIGINFO | flags;
-	sigemptyset(&sa.sa_mask);
-	if (sigaction(sig, &sa, 0))
-		ksft_exit_fail_msg("sigaction failed\n");
-}
 
 static void sigsegv(int sig, siginfo_t *info, void *ctx_void)
 {

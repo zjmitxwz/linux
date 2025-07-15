@@ -5,18 +5,41 @@
 #include "disk_groups.h"
 #include "error.h"
 #include "opts.h"
+#include "recovery_passes.h"
 #include "replicas.h"
 #include "sb-members.h"
 #include "super-io.h"
 
-void bch2_dev_missing(struct bch_fs *c, unsigned dev)
+int bch2_dev_missing_bkey(struct bch_fs *c, struct bkey_s_c k, unsigned dev)
 {
-	bch2_fs_inconsistent(c, "pointer to nonexistent device %u", dev);
+	struct printbuf buf = PRINTBUF;
+	bch2_log_msg_start(c, &buf);
+
+	prt_printf(&buf, "pointer to nonexistent device %u in key\n", dev);
+	bch2_bkey_val_to_text(&buf, c, k);
+
+	bool print = bch2_count_fsck_err(c, ptr_to_invalid_device, &buf);
+
+	int ret = bch2_run_explicit_recovery_pass(c, &buf,
+					BCH_RECOVERY_PASS_check_allocations, 0);
+
+	if (print)
+		bch2_print_str(c, KERN_ERR, buf.buf);
+	printbuf_exit(&buf);
+	return ret;
 }
 
-void bch2_dev_bucket_missing(struct bch_fs *c, struct bpos bucket)
+void bch2_dev_missing_atomic(struct bch_fs *c, unsigned dev)
 {
-	bch2_fs_inconsistent(c, "pointer to nonexistent bucket %llu:%llu", bucket.inode, bucket.offset);
+	if (dev != BCH_SB_MEMBER_INVALID)
+		bch2_fs_inconsistent(c, "pointer to nonexistent device %u", dev);
+}
+
+void bch2_dev_bucket_missing(struct bch_dev *ca, u64 bucket)
+{
+	bch2_fs_inconsistent(ca->fs,
+		"pointer to nonexistent bucket %llu on device %s (valid range %u-%llu)",
+		bucket, ca->name, ca->mi.first_bucket, ca->mi.nbuckets);
 }
 
 #define x(t, n, ...) [n] = #t,
@@ -78,7 +101,7 @@ static int sb_members_v2_resize_entries(struct bch_fs *c)
 
 		mi = bch2_sb_field_resize(&c->disk_sb, members_v2, u64s);
 		if (!mi)
-			return -BCH_ERR_ENOSPC_sb_members_v2;
+			return bch_err_throw(c, ENOSPC_sb_members_v2);
 
 		for (int i = c->disk_sb.sb->nr_devices - 1; i >= 0; --i) {
 			void *dst = (void *) mi->_members + (i * sizeof(struct bch_member));
@@ -115,6 +138,11 @@ int bch2_sb_members_cpy_v2_v1(struct bch_sb_handle *disk_sb)
 {
 	struct bch_sb_field_members_v1 *mi1;
 	struct bch_sb_field_members_v2 *mi2;
+
+	if (BCH_SB_VERSION_INCOMPAT(disk_sb->sb) > bcachefs_metadata_version_extent_flags) {
+		bch2_sb_field_resize(disk_sb, members_v1, 0);
+		return 0;
+	}
 
 	mi1 = bch2_sb_field_resize(disk_sb, members_v1,
 			DIV_ROUND_UP(sizeof(*mi1) + BCH_MEMBER_V1_BYTES *
@@ -162,6 +190,17 @@ static int validate_member(struct printbuf *err,
 		return -BCH_ERR_invalid_sb_members;
 	}
 
+	if (m.btree_bitmap_shift >= BCH_MI_BTREE_BITMAP_SHIFT_MAX) {
+		prt_printf(err, "device %u: invalid btree_bitmap_shift %u", i, m.btree_bitmap_shift);
+		return -BCH_ERR_invalid_sb_members;
+	}
+
+	if (BCH_MEMBER_FREESPACE_INITIALIZED(&m) &&
+	    sb->features[0] & cpu_to_le64(BIT_ULL(BCH_FEATURE_no_alloc_info))) {
+		prt_printf(err, "device %u: freespace initialized but fs has no alloc info", i);
+		return -BCH_ERR_invalid_sb_members;
+	}
+
 	return 0;
 }
 
@@ -183,17 +222,11 @@ static void member_to_text(struct printbuf *out,
 	printbuf_indent_add(out, 2);
 
 	prt_printf(out, "Label:\t");
-	if (BCH_MEMBER_GROUP(&m)) {
-		unsigned idx = BCH_MEMBER_GROUP(&m) - 1;
-
-		if (idx < disk_groups_nr(gi))
-			prt_printf(out, "%s (%u)",
-				   gi->entries[idx].label, idx);
-		else
-			prt_printf(out, "(bad disk labels section)");
-	} else {
+	if (BCH_MEMBER_GROUP(&m))
+		bch2_disk_path_to_text_sb(out, sb,
+				BCH_MEMBER_GROUP(&m) - 1);
+	else
 		prt_printf(out, "(none)");
-	}
 	prt_newline(out);
 
 	prt_printf(out, "UUID:\t");
@@ -246,7 +279,10 @@ static void member_to_text(struct printbuf *out,
 	prt_newline(out);
 
 	prt_printf(out, "Btree allocated bitmap blocksize:\t");
-	prt_units_u64(out, 1ULL << m.btree_bitmap_shift);
+	if (m.btree_bitmap_shift < 64)
+		prt_units_u64(out, 1ULL << m.btree_bitmap_shift);
+	else
+		prt_printf(out, "(invalid shift %u)", m.btree_bitmap_shift);
 	prt_newline(out);
 
 	prt_printf(out, "Btree allocated bitmap:\t");
@@ -257,6 +293,7 @@ static void member_to_text(struct printbuf *out,
 
 	prt_printf(out, "Discard:\t%llu\n", BCH_MEMBER_DISCARD(&m));
 	prt_printf(out, "Freespace initialized:\t%llu\n", BCH_MEMBER_FREESPACE_INITIALIZED(&m));
+	prt_printf(out, "Resize on mount:\t%llu\n", BCH_MEMBER_RESIZE_ON_MOUNT(&m));
 
 	printbuf_indent_sub(out, 2);
 }
@@ -288,9 +325,17 @@ static void bch2_sb_members_v1_to_text(struct printbuf *out, struct bch_sb *sb,
 {
 	struct bch_sb_field_members_v1 *mi = field_to_type(f, members_v1);
 	struct bch_sb_field_disk_groups *gi = bch2_sb_field_get(sb, disk_groups);
-	unsigned i;
 
-	for (i = 0; i < sb->nr_devices; i++)
+	if (vstruct_end(&mi->field) <= (void *) &mi->_members[0]) {
+		prt_printf(out, "field ends before start of entries");
+		return;
+	}
+
+	unsigned nr = (vstruct_end(&mi->field) - (void *) &mi->_members[0]) / sizeof(mi->_members[0]);
+	if (nr != sb->nr_devices)
+		prt_printf(out, "nr_devices mismatch: have %i entries, should be %u", nr, sb->nr_devices);
+
+	for (unsigned i = 0; i < min(sb->nr_devices, nr); i++)
 		member_to_text(out, members_v1_get(mi, i), gi, sb, i);
 }
 
@@ -304,9 +349,27 @@ static void bch2_sb_members_v2_to_text(struct printbuf *out, struct bch_sb *sb,
 {
 	struct bch_sb_field_members_v2 *mi = field_to_type(f, members_v2);
 	struct bch_sb_field_disk_groups *gi = bch2_sb_field_get(sb, disk_groups);
-	unsigned i;
 
-	for (i = 0; i < sb->nr_devices; i++)
+	if (vstruct_end(&mi->field) <= (void *) &mi->_members[0]) {
+		prt_printf(out, "field ends before start of entries");
+		return;
+	}
+
+	if (!le16_to_cpu(mi->member_bytes)) {
+		prt_printf(out, "member_bytes 0");
+		return;
+	}
+
+	unsigned nr = (vstruct_end(&mi->field) - (void *) &mi->_members[0]) / le16_to_cpu(mi->member_bytes);
+	if (nr != sb->nr_devices)
+		prt_printf(out, "nr_devices mismatch: have %i entries, should be %u", nr, sb->nr_devices);
+
+	/*
+	 * We call to_text() on superblock sections that haven't passed
+	 * validate, so we can't trust sb->nr_devices.
+	 */
+
+	for (unsigned i = 0; i < min(sb->nr_devices, nr); i++)
 		member_to_text(out, members_v2_get(mi, i), gi, sb, i);
 }
 
@@ -341,14 +404,13 @@ void bch2_sb_members_from_cpu(struct bch_fs *c)
 {
 	struct bch_sb_field_members_v2 *mi = bch2_sb_field_get(c->disk_sb.sb, members_v2);
 
-	rcu_read_lock();
+	guard(rcu)();
 	for_each_member_device_rcu(c, ca, NULL) {
 		struct bch_member *m = __bch2_members_v2_get_mut(mi, ca->dev_idx);
 
 		for (unsigned e = 0; e < BCH_MEMBER_ERROR_NR; e++)
 			m->errors[e] = cpu_to_le64(atomic64_read(&ca->errors[e]));
 	}
-	rcu_read_unlock();
 }
 
 void bch2_dev_io_errors_to_text(struct printbuf *out, struct bch_dev *ca)
@@ -406,20 +468,14 @@ void bch2_dev_errors_reset(struct bch_dev *ca)
 
 bool bch2_dev_btree_bitmap_marked(struct bch_fs *c, struct bkey_s_c k)
 {
-	bool ret = true;
-	rcu_read_lock();
+	guard(rcu)();
 	bkey_for_each_ptr(bch2_bkey_ptrs_c(k), ptr) {
 		struct bch_dev *ca = bch2_dev_rcu(c, ptr->dev);
-		if (!ca)
-			continue;
-
-		if (!bch2_dev_btree_bitmap_marked_sectors(ca, ptr->offset, btree_sectors(c))) {
-			ret = false;
-			break;
-		}
+		if (ca &&
+		    !bch2_dev_btree_bitmap_marked_sectors(ca, ptr->offset, btree_sectors(c)))
+			return false;
 	}
-	rcu_read_unlock();
-	return ret;
+	return true;
 }
 
 static void __bch2_dev_btree_bitmap_mark(struct bch_sb_field_members_v2 *mi, unsigned dev,
@@ -441,7 +497,7 @@ static void __bch2_dev_btree_bitmap_mark(struct bch_sb_field_members_v2 *mi, uns
 		m->btree_bitmap_shift += resize;
 	}
 
-	BUG_ON(m->btree_bitmap_shift > 57);
+	BUG_ON(m->btree_bitmap_shift >= BCH_MI_BTREE_BITMAP_SHIFT_MAX);
 	BUG_ON(end > 64ULL << m->btree_bitmap_shift);
 
 	for (unsigned bit = start >> m->btree_bitmap_shift;
@@ -463,4 +519,88 @@ void bch2_dev_btree_bitmap_mark(struct bch_fs *c, struct bkey_s_c k)
 
 		__bch2_dev_btree_bitmap_mark(mi, ptr->dev, ptr->offset, btree_sectors(c));
 	}
+}
+
+unsigned bch2_sb_nr_devices(const struct bch_sb *sb)
+{
+	unsigned nr = 0;
+
+	for (unsigned i = 0; i < sb->nr_devices; i++)
+		nr += bch2_member_exists((struct bch_sb *) sb, i);
+	return nr;
+}
+
+int bch2_sb_member_alloc(struct bch_fs *c)
+{
+	unsigned dev_idx = c->sb.nr_devices;
+	struct bch_sb_field_members_v2 *mi;
+	unsigned nr_devices;
+	unsigned u64s;
+	int best = -1;
+	u64 best_last_mount = 0;
+	unsigned nr_deleted = 0;
+
+	if (dev_idx < BCH_SB_MEMBERS_MAX)
+		goto have_slot;
+
+	for (dev_idx = 0; dev_idx < BCH_SB_MEMBERS_MAX; dev_idx++) {
+		/* eventually BCH_SB_MEMBERS_MAX will be raised */
+		if (dev_idx == BCH_SB_MEMBER_INVALID)
+			continue;
+
+		struct bch_member m = bch2_sb_member_get(c->disk_sb.sb, dev_idx);
+
+		nr_deleted += uuid_equal(&m.uuid, &BCH_SB_MEMBER_DELETED_UUID);
+
+		if (!bch2_is_zero(&m.uuid, sizeof(m.uuid)))
+			continue;
+
+		u64 last_mount = le64_to_cpu(m.last_mount);
+		if (best < 0 || last_mount < best_last_mount) {
+			best = dev_idx;
+			best_last_mount = last_mount;
+		}
+	}
+	if (best >= 0) {
+		dev_idx = best;
+		goto have_slot;
+	}
+
+	if (nr_deleted)
+		bch_err(c, "unable to allocate new member, but have %u deleted: run fsck",
+			nr_deleted);
+
+	return -BCH_ERR_ENOSPC_sb_members;
+have_slot:
+	nr_devices = max_t(unsigned, dev_idx + 1, c->sb.nr_devices);
+
+	mi = bch2_sb_field_get(c->disk_sb.sb, members_v2);
+	u64s = DIV_ROUND_UP(sizeof(struct bch_sb_field_members_v2) +
+			    le16_to_cpu(mi->member_bytes) * nr_devices, sizeof(u64));
+
+	mi = bch2_sb_field_resize(&c->disk_sb, members_v2, u64s);
+	if (!mi)
+		return -BCH_ERR_ENOSPC_sb_members;
+
+	c->disk_sb.sb->nr_devices = nr_devices;
+	return dev_idx;
+}
+
+void bch2_sb_members_clean_deleted(struct bch_fs *c)
+{
+	mutex_lock(&c->sb_lock);
+	bool write_sb = false;
+
+	for (unsigned i = 0; i < c->sb.nr_devices; i++) {
+		struct bch_member *m = bch2_members_v2_get_mut(c->disk_sb.sb, i);
+
+		if (uuid_equal(&m->uuid, &BCH_SB_MEMBER_DELETED_UUID)) {
+			memset(&m->uuid, 0, sizeof(m->uuid));
+			write_sb = true;
+		}
+	}
+
+	if (write_sb)
+		bch2_write_super(c);
+	mutex_unlock(&c->sb_lock);
 }

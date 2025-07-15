@@ -261,34 +261,14 @@ static ssize_t enabled_show(struct device *device,
 }
 
 static ssize_t edid_show(struct file *filp, struct kobject *kobj,
-			 struct bin_attribute *attr, char *buf, loff_t off,
+			 const struct bin_attribute *attr, char *buf, loff_t off,
 			 size_t count)
 {
 	struct device *connector_dev = kobj_to_dev(kobj);
 	struct drm_connector *connector = to_drm_connector(connector_dev);
-	unsigned char *edid;
-	size_t size;
-	ssize_t ret = 0;
+	ssize_t ret;
 
-	mutex_lock(&connector->dev->mode_config.mutex);
-	if (!connector->edid_blob_ptr)
-		goto unlock;
-
-	edid = connector->edid_blob_ptr->data;
-	size = connector->edid_blob_ptr->length;
-	if (!edid)
-		goto unlock;
-
-	if (off >= size)
-		goto unlock;
-
-	if (off + count > size)
-		count = size - off;
-	memcpy(buf, edid + off, count);
-
-	ret = count;
-unlock:
-	mutex_unlock(&connector->dev->mode_config.mutex);
+	ret = drm_edid_connector_property_show(connector, buf, off, count);
 
 	return ret;
 }
@@ -335,21 +315,21 @@ static struct attribute *connector_dev_attrs[] = {
 	NULL
 };
 
-static struct bin_attribute edid_attr = {
+static const struct bin_attribute edid_attr = {
 	.attr.name = "edid",
 	.attr.mode = 0444,
 	.size = 0,
-	.read = edid_show,
+	.read_new = edid_show,
 };
 
-static struct bin_attribute *connector_bin_attrs[] = {
+static const struct bin_attribute *const connector_bin_attrs[] = {
 	&edid_attr,
 	NULL
 };
 
 static const struct attribute_group connector_dev_group = {
 	.attrs = connector_dev_attrs,
-	.bin_attrs = connector_bin_attrs,
+	.bin_attrs_new = connector_bin_attrs,
 };
 
 static const struct attribute_group *connector_dev_groups[] = {

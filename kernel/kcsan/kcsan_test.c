@@ -1500,8 +1500,8 @@ static int access_thread(void *arg)
 				func();
 		}
 	} while (!torture_must_stop());
-	del_timer_sync(&timer);
-	destroy_timer_on_stack(&timer);
+	timer_delete_sync(&timer);
+	timer_destroy_on_stack(&timer);
 
 	torture_kthread_stopping("access_thread");
 	return 0;
@@ -1620,5 +1620,6 @@ static struct kunit_suite kcsan_test_suite = {
 
 kunit_test_suites(&kcsan_test_suite);
 
+MODULE_DESCRIPTION("KCSAN test suite");
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Marco Elver <elver@google.com>");

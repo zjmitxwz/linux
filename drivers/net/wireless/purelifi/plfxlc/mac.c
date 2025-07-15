@@ -102,7 +102,6 @@ int plfxlc_mac_init_hw(struct ieee80211_hw *hw)
 void plfxlc_mac_release(struct plfxlc_mac *mac)
 {
 	plfxlc_chip_release(&mac->chip);
-	lockdep_assert_held(&mac->lock);
 }
 
 int plfxlc_op_start(struct ieee80211_hw *hw)
@@ -111,7 +110,7 @@ int plfxlc_op_start(struct ieee80211_hw *hw)
 	return 0;
 }
 
-void plfxlc_op_stop(struct ieee80211_hw *hw)
+void plfxlc_op_stop(struct ieee80211_hw *hw, bool suspend)
 {
 	struct plfxlc_mac *mac = plfxlc_hw_mac(hw);
 

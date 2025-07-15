@@ -28,6 +28,7 @@
 #include "cifs_debug.h"
 #include "smb2proto.h"
 #include "smbdirect.h"
+#include "compress.h"
 
 /* Max number of iovectors we can use off the stack when sending requests. */
 #define CIFS_MAX_IOV_SIZE 8
@@ -178,7 +179,7 @@ delete_mid(struct mid_q_entry *mid)
  * Our basic "send data to server" function. Should be called with srv_mutex
  * held. The caller is responsible for handling the results.
  */
-static int
+int
 smb_send_kvec(struct TCP_Server_Info *server, struct msghdr *smb_msg,
 	      size_t *sent)
 {
@@ -417,20 +418,20 @@ out:
 	return rc;
 }
 
-struct send_req_vars {
-	struct smb2_transform_hdr tr_hdr;
-	struct smb_rqst rqst[MAX_COMPOUND];
-	struct kvec iov;
-};
-
 static int
 smb_send_rqst(struct TCP_Server_Info *server, int num_rqst,
 	      struct smb_rqst *rqst, int flags)
 {
-	struct send_req_vars *vars;
-	struct smb_rqst *cur_rqst;
-	struct kvec *iov;
+	struct smb2_transform_hdr tr_hdr;
+	struct smb_rqst new_rqst[MAX_COMPOUND] = {};
+	struct kvec iov = {
+		.iov_base = &tr_hdr,
+		.iov_len = sizeof(tr_hdr),
+	};
 	int rc;
+
+	if (flags & CIFS_COMPRESS_REQ)
+		return smb_compress(server, &rqst[0], __smb_send_rqst);
 
 	if (!(flags & CIFS_TRANSFORM_REQ))
 		return __smb_send_rqst(server, num_rqst, rqst);
@@ -443,26 +444,15 @@ smb_send_rqst(struct TCP_Server_Info *server, int num_rqst,
 		return -EIO;
 	}
 
-	vars = kzalloc(sizeof(*vars), GFP_NOFS);
-	if (!vars)
-		return -ENOMEM;
-	cur_rqst = vars->rqst;
-	iov = &vars->iov;
-
-	iov->iov_base = &vars->tr_hdr;
-	iov->iov_len = sizeof(vars->tr_hdr);
-	cur_rqst[0].rq_iov = iov;
-	cur_rqst[0].rq_nvec = 1;
+	new_rqst[0].rq_iov = &iov;
+	new_rqst[0].rq_nvec = 1;
 
 	rc = server->ops->init_transform_rq(server, num_rqst + 1,
-					    &cur_rqst[0], rqst);
-	if (rc)
-		goto out;
-
-	rc = __smb_send_rqst(server, num_rqst + 1, &cur_rqst[0]);
-	smb3_free_compound_rqst(num_rqst, &cur_rqst[1]);
-out:
-	kfree(vars);
+					    new_rqst, rqst);
+	if (!rc) {
+		rc = __smb_send_rqst(server, num_rqst + 1, new_rqst);
+		smb3_free_compound_rqst(num_rqst, &new_rqst[1]);
+	}
 	return rc;
 }
 
@@ -904,6 +894,9 @@ cifs_sync_mid_result(struct mid_q_entry *mid, struct TCP_Server_Info *server)
 	case MID_SHUTDOWN:
 		rc = -EHOSTDOWN;
 		break;
+	case MID_RC:
+		rc = mid->mid_rc;
+		break;
 	default:
 		if (!(mid->mid_flags & MID_DELETED)) {
 			list_del_init(&mid->qhead);
@@ -988,10 +981,10 @@ static void
 cifs_compound_callback(struct mid_q_entry *mid)
 {
 	struct TCP_Server_Info *server = mid->server;
-	struct cifs_credits credits;
-
-	credits.value = server->ops->get_credits(mid);
-	credits.instance = server->reconnect_instance;
+	struct cifs_credits credits = {
+		.value = server->ops->get_credits(mid),
+		.instance = server->reconnect_instance,
+	};
 
 	add_credits(server, &credits, mid->optype);
 
@@ -1025,14 +1018,16 @@ struct TCP_Server_Info *cifs_pick_channel(struct cifs_ses *ses)
 	uint index = 0;
 	unsigned int min_in_flight = UINT_MAX, max_in_flight = 0;
 	struct TCP_Server_Info *server = NULL;
-	int i;
+	int i, start, cur;
 
 	if (!ses)
 		return NULL;
 
 	spin_lock(&ses->chan_lock);
+	start = atomic_inc_return(&ses->chan_seq);
 	for (i = 0; i < ses->chan_count; i++) {
-		server = ses->chans[i].server;
+		cur = (start + i) % ses->chan_count;
+		server = ses->chans[cur].server;
 		if (!server || server->terminate)
 			continue;
 
@@ -1049,17 +1044,15 @@ struct TCP_Server_Info *cifs_pick_channel(struct cifs_ses *ses)
 		 */
 		if (server->in_flight < min_in_flight) {
 			min_in_flight = server->in_flight;
-			index = i;
+			index = cur;
 		}
 		if (server->in_flight > max_in_flight)
 			max_in_flight = server->in_flight;
 	}
 
 	/* if all channels are equally loaded, fall back to round-robin */
-	if (min_in_flight == max_in_flight) {
-		index = (uint)atomic_inc_return(&ses->chan_seq);
-		index %= ses->chan_count;
-	}
+	if (min_in_flight == max_in_flight)
+		index = (uint)start % ses->chan_count;
 
 	server = ses->chans[index].server;
 	spin_unlock(&ses->chan_lock);
@@ -1289,7 +1282,7 @@ compound_send_recv(const unsigned int xid, struct cifs_ses *ses,
 out:
 	/*
 	 * This will dequeue all mids. After this it is important that the
-	 * demultiplex_thread will not process any of these mids any futher.
+	 * demultiplex_thread will not process any of these mids any further.
 	 * This is prevented above by using a noop callback that will not
 	 * wake this thread except for the very last PDU.
 	 */
@@ -1813,11 +1806,8 @@ cifs_readv_receive(struct TCP_Server_Info *server, struct mid_q_entry *mid)
 		length = data_len; /* An RDMA read is already done. */
 	else
 #endif
-	{
 		length = cifs_read_iter_from_socket(server, &rdata->subreq.io_iter,
 						    data_len);
-		iov_iter_revert(&rdata->subreq.io_iter, data_len);
-	}
 	if (length > 0)
 		rdata->got_bytes += length;
 	server->total_read += length;

@@ -42,7 +42,7 @@ static struct inode *tracefs_alloc_inode(struct super_block *sb)
 	struct tracefs_inode *ti;
 	unsigned long flags;
 
-	ti = kmem_cache_alloc(tracefs_inode_cachep, GFP_KERNEL);
+	ti = alloc_inode_sb(sb, tracefs_inode_cachep, GFP_KERNEL);
 	if (!ti)
 		return NULL;
 
@@ -53,15 +53,14 @@ static struct inode *tracefs_alloc_inode(struct super_block *sb)
 	return &ti->vfs_inode;
 }
 
-static void tracefs_free_inode_rcu(struct rcu_head *rcu)
+static void tracefs_free_inode(struct inode *inode)
 {
-	struct tracefs_inode *ti;
+	struct tracefs_inode *ti = get_tracefs(inode);
 
-	ti = container_of(rcu, struct tracefs_inode, rcu);
 	kmem_cache_free(tracefs_inode_cachep, ti);
 }
 
-static void tracefs_free_inode(struct inode *inode)
+static void tracefs_destroy_inode(struct inode *inode)
 {
 	struct tracefs_inode *ti = get_tracefs(inode);
 	unsigned long flags;
@@ -69,8 +68,6 @@ static void tracefs_free_inode(struct inode *inode)
 	spin_lock_irqsave(&tracefs_inode_lock, flags);
 	list_del_rcu(&ti->list);
 	spin_unlock_irqrestore(&tracefs_inode_lock, flags);
-
-	call_rcu(&ti->rcu, tracefs_free_inode_rcu);
 }
 
 static ssize_t default_read_file(struct file *file, char __user *buf,
@@ -112,9 +109,9 @@ static char *get_dname(struct dentry *dentry)
 	return name;
 }
 
-static int tracefs_syscall_mkdir(struct mnt_idmap *idmap,
-				 struct inode *inode, struct dentry *dentry,
-				 umode_t mode)
+static struct dentry *tracefs_syscall_mkdir(struct mnt_idmap *idmap,
+					    struct inode *inode, struct dentry *dentry,
+					    umode_t mode)
 {
 	struct tracefs_inode *ti;
 	char *name;
@@ -122,7 +119,7 @@ static int tracefs_syscall_mkdir(struct mnt_idmap *idmap,
 
 	name = get_dname(dentry);
 	if (!name)
-		return -ENOMEM;
+		return ERR_PTR(-ENOMEM);
 
 	/*
 	 * This is a new directory that does not take the default of
@@ -144,7 +141,7 @@ static int tracefs_syscall_mkdir(struct mnt_idmap *idmap,
 
 	kfree(name);
 
-	return ret;
+	return ERR_PTR(ret);
 }
 
 static int tracefs_syscall_rmdir(struct inode *inode, struct dentry *dentry)
@@ -296,9 +293,9 @@ enum {
 };
 
 static const struct fs_parameter_spec tracefs_param_specs[] = {
-	fsparam_u32	("gid",		Opt_gid),
+	fsparam_gid	("gid",		Opt_gid),
 	fsparam_u32oct	("mode",	Opt_mode),
-	fsparam_u32	("uid",		Opt_uid),
+	fsparam_uid	("uid",		Opt_uid),
 	{}
 };
 
@@ -306,8 +303,6 @@ static int tracefs_parse_param(struct fs_context *fc, struct fs_parameter *param
 {
 	struct tracefs_fs_info *opts = fc->s_fs_info;
 	struct fs_parse_result result;
-	kuid_t uid;
-	kgid_t gid;
 	int opt;
 
 	opt = fs_parse(fc, tracefs_param_specs, param, &result);
@@ -316,16 +311,10 @@ static int tracefs_parse_param(struct fs_context *fc, struct fs_parameter *param
 
 	switch (opt) {
 	case Opt_uid:
-		uid = make_kuid(current_user_ns(), result.uint_32);
-		if (!uid_valid(uid))
-			return invalf(fc, "Unknown uid");
-		opts->uid = uid;
+		opts->uid = result.uid;
 		break;
 	case Opt_gid:
-		gid = make_kgid(current_user_ns(), result.uint_32);
-		if (!gid_valid(gid))
-			return invalf(fc, "Unknown gid");
-		opts->gid = gid;
+		opts->gid = result.gid;
 		break;
 	case Opt_mode:
 		opts->mode = result.uint_32 & S_IALLUGO;
@@ -403,6 +392,9 @@ static int tracefs_reconfigure(struct fs_context *fc)
 	struct tracefs_fs_info *sb_opts = sb->s_fs_info;
 	struct tracefs_fs_info *new_opts = fc->s_fs_info;
 
+	if (!new_opts)
+		return 0;
+
 	sync_filesystem(sb);
 	/* structure copy of new mount options to sb */
 	*sb_opts = *new_opts;
@@ -445,6 +437,7 @@ static int tracefs_drop_inode(struct inode *inode)
 static const struct super_operations tracefs_super_operations = {
 	.alloc_inode    = tracefs_alloc_inode,
 	.free_inode     = tracefs_free_inode,
+	.destroy_inode  = tracefs_destroy_inode,
 	.drop_inode     = tracefs_drop_inode,
 	.statfs		= simple_statfs,
 	.show_options	= tracefs_show_options,
@@ -464,7 +457,8 @@ static void tracefs_d_release(struct dentry *dentry)
 		eventfs_d_release(dentry);
 }
 
-static int tracefs_d_revalidate(struct dentry *dentry, unsigned int flags)
+static int tracefs_d_revalidate(struct inode *inode, const struct qstr *name,
+				struct dentry *dentry, unsigned int flags)
 {
 	struct eventfs_inode *ei = dentry->d_fsdata;
 
@@ -488,14 +482,17 @@ static int tracefs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_op = &tracefs_super_operations;
 	sb->s_d_op = &tracefs_dentry_operations;
 
-	tracefs_apply_options(sb, false);
-
 	return 0;
 }
 
 static int tracefs_get_tree(struct fs_context *fc)
 {
-	return get_tree_single(fc, tracefs_fill_super);
+	int err = get_tree_single(fc, tracefs_fill_super);
+
+	if (err)
+		return err;
+
+	return tracefs_reconfigure(fc);
 }
 
 static void tracefs_free_fc(struct fs_context *fc)
@@ -558,7 +555,7 @@ struct dentry *tracefs_start_creating(const char *name, struct dentry *parent)
 	if (unlikely(IS_DEADDIR(d_inode(parent))))
 		dentry = ERR_PTR(-ENOENT);
 	else
-		dentry = lookup_one_len(name, parent, strlen(name));
+		dentry = lookup_noperm(&QSTR(name), parent);
 	if (!IS_ERR(dentry) && d_inode(dentry)) {
 		dput(dentry);
 		dentry = ERR_PTR(-EEXIST);

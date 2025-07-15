@@ -804,8 +804,7 @@ static int ipmmu_init_arm_mapping(struct device *dev)
 	if (!mmu->mapping) {
 		struct dma_iommu_mapping *mapping;
 
-		mapping = arm_iommu_create_mapping(&platform_bus_type,
-						   SZ_1G, SZ_2G);
+		mapping = arm_iommu_create_mapping(dev, SZ_1G, SZ_2G);
 		if (IS_ERR(mapping)) {
 			dev_err(mmu->dev, "failed to create ARM IOMMU mapping\n");
 			ret = PTR_ERR(mapping);
@@ -1082,31 +1081,25 @@ static int ipmmu_probe(struct platform_device *pdev)
 		}
 	}
 
+	platform_set_drvdata(pdev, mmu);
 	/*
 	 * Register the IPMMU to the IOMMU subsystem in the following cases:
 	 * - R-Car Gen2 IPMMU (all devices registered)
 	 * - R-Car Gen3 IPMMU (leaf devices only - skip root IPMMU-MM device)
 	 */
-	if (!mmu->features->has_cache_leaf_nodes || !ipmmu_is_root(mmu)) {
-		ret = iommu_device_sysfs_add(&mmu->iommu, &pdev->dev, NULL,
-					     dev_name(&pdev->dev));
-		if (ret)
-			return ret;
+	if (mmu->features->has_cache_leaf_nodes && ipmmu_is_root(mmu))
+		return 0;
 
-		ret = iommu_device_register(&mmu->iommu, &ipmmu_ops, &pdev->dev);
-		if (ret)
-			return ret;
-	}
+	ret = iommu_device_sysfs_add(&mmu->iommu, &pdev->dev, NULL, "%s",
+				     dev_name(&pdev->dev));
+	if (ret)
+		return ret;
 
-	/*
-	 * We can't create the ARM mapping here as it requires the bus to have
-	 * an IOMMU, which only happens when bus_set_iommu() is called in
-	 * ipmmu_init() after the probe function returns.
-	 */
+	ret = iommu_device_register(&mmu->iommu, &ipmmu_ops, &pdev->dev);
+	if (ret)
+		iommu_device_sysfs_remove(&mmu->iommu);
 
-	platform_set_drvdata(pdev, mmu);
-
-	return 0;
+	return ret;
 }
 
 static void ipmmu_remove(struct platform_device *pdev)
@@ -1160,6 +1153,6 @@ static struct platform_driver ipmmu_driver = {
 		.pm = pm_sleep_ptr(&ipmmu_pm),
 	},
 	.probe = ipmmu_probe,
-	.remove_new = ipmmu_remove,
+	.remove = ipmmu_remove,
 };
 builtin_platform_driver(ipmmu_driver);

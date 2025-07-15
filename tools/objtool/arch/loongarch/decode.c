@@ -5,10 +5,7 @@
 #include <asm/inst.h>
 #include <asm/orc_types.h>
 #include <linux/objtool_types.h>
-
-#ifndef EM_LOONGARCH
-#define EM_LOONGARCH	258
-#endif
+#include <arch/elf.h>
 
 int arch_ftrace_match(char *name)
 {
@@ -66,7 +63,7 @@ static bool is_loongarch(const struct elf *elf)
 	if (elf->ehdr.e_machine == EM_LOONGARCH)
 		return true;
 
-	WARN("unexpected ELF machine type %d", elf->ehdr.e_machine);
+	ERROR("unexpected ELF machine type %d", elf->ehdr.e_machine);
 	return false;
 }
 
@@ -122,7 +119,7 @@ static bool decode_insn_reg2i12_fomat(union loongarch_instruction inst,
 	switch (inst.reg2i12_format.opcode) {
 	case addid_op:
 		if ((inst.reg2i12_format.rd == CFI_SP) || (inst.reg2i12_format.rj == CFI_SP)) {
-			/* addi.d sp,sp,si12 or addi.d fp,sp,si12 */
+			/* addi.d sp,sp,si12 or addi.d fp,sp,si12 or addi.d sp,fp,si12 */
 			insn->immediate = sign_extend64(inst.reg2i12_format.immediate, 11);
 			ADD_OP(op) {
 				op->src.type = OP_SRC_ADD;
@@ -131,6 +128,15 @@ static bool decode_insn_reg2i12_fomat(union loongarch_instruction inst,
 				op->dest.type = OP_DEST_REG;
 				op->dest.reg = inst.reg2i12_format.rd;
 			}
+		}
+		if ((inst.reg2i12_format.rd == CFI_SP) && (inst.reg2i12_format.rj == CFI_FP)) {
+			/* addi.d sp,fp,si12 */
+			struct symbol *func = find_func_containing(insn->sec, insn->offset);
+
+			if (!func)
+				return false;
+
+			func->frame_pointer = true;
 		}
 		break;
 	case ldd_op:
@@ -321,8 +327,10 @@ const char *arch_nop_insn(int len)
 {
 	static u32 nop;
 
-	if (len != LOONGARCH_INSN_SIZE)
-		WARN("invalid NOP size: %d\n", len);
+	if (len != LOONGARCH_INSN_SIZE) {
+		ERROR("invalid NOP size: %d\n", len);
+		return NULL;
+	}
 
 	nop = LOONGARCH_INSN_NOP;
 
@@ -333,8 +341,10 @@ const char *arch_ret_insn(int len)
 {
 	static u32 ret;
 
-	if (len != LOONGARCH_INSN_SIZE)
-		WARN("invalid RET size: %d\n", len);
+	if (len != LOONGARCH_INSN_SIZE) {
+		ERROR("invalid RET size: %d\n", len);
+		return NULL;
+	}
 
 	emit_jirl((union loongarch_instruction *)&ret, LOONGARCH_GPR_RA, LOONGARCH_GPR_ZERO, 0);
 
@@ -353,4 +363,27 @@ void arch_initial_func_cfi_state(struct cfi_init_state *state)
 	/* initial CFA (call frame address) */
 	state->cfa.base = CFI_SP;
 	state->cfa.offset = 0;
+}
+
+unsigned int arch_reloc_size(struct reloc *reloc)
+{
+	switch (reloc_type(reloc)) {
+	case R_LARCH_32:
+	case R_LARCH_32_PCREL:
+		return 4;
+	default:
+		return 8;
+	}
+}
+
+unsigned long arch_jump_table_sym_offset(struct reloc *reloc, struct reloc *table)
+{
+	switch (reloc_type(reloc)) {
+	case R_LARCH_32_PCREL:
+	case R_LARCH_64_PCREL:
+		return reloc->sym->offset + reloc_addend(reloc) -
+		       (reloc_offset(reloc) - reloc_offset(table));
+	default:
+		return reloc->sym->offset + reloc_addend(reloc);
+	}
 }

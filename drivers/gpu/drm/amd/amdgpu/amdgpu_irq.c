@@ -466,7 +466,8 @@ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
 	} else	if (src_id >= AMDGPU_MAX_IRQ_SRC_ID) {
 		DRM_DEBUG("Invalid src_id in IV: %d\n", src_id);
 
-	} else if ((client_id == AMDGPU_IRQ_CLIENTID_LEGACY) &&
+	} else if (((client_id == AMDGPU_IRQ_CLIENTID_LEGACY) ||
+		    (client_id == SOC15_IH_CLIENTID_ISP)) &&
 		   adev->irq.virq[src_id]) {
 		generic_handle_domain_irq(adev->irq.domain, src_id);
 
@@ -618,6 +619,10 @@ int amdgpu_irq_get(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
 int amdgpu_irq_put(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
 		   unsigned int type)
 {
+	/* When the threshold is reached,the interrupt source may not be enabled.return -EINVAL */
+	if (amdgpu_ras_is_rma(adev))
+		return -EINVAL;
+
 	if (!adev->irq.installed)
 		return -ENOENT;
 
@@ -724,8 +729,8 @@ static const struct irq_domain_ops amdgpu_hw_irqdomain_ops = {
  */
 int amdgpu_irq_add_domain(struct amdgpu_device *adev)
 {
-	adev->irq.domain = irq_domain_add_linear(NULL, AMDGPU_MAX_IRQ_SRC_ID,
-						 &amdgpu_hw_irqdomain_ops, adev);
+	adev->irq.domain = irq_domain_create_linear(NULL, AMDGPU_MAX_IRQ_SRC_ID,
+						    &amdgpu_hw_irqdomain_ops, adev);
 	if (!adev->irq.domain) {
 		DRM_ERROR("GPU irq add domain failed\n");
 		return -ENODEV;

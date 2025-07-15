@@ -19,7 +19,7 @@
 #include <linux/i2c.h>
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 /*
  * maximum accumulation time should be (17 * 60 * 1000) around 17 minutes@1024 sps
@@ -225,11 +225,6 @@ enum pac1934_ch_idx {
 struct pac1934_features {
 	u8		phys_channels;
 	const char	*name;
-};
-
-struct samp_rate_mapping {
-	u16 samp_rate;
-	u8 shift2value;
 };
 
 static const unsigned int samp_rate_map_tbl[] = {
@@ -1086,7 +1081,7 @@ static int pac1934_chip_identify(struct pac1934_chip_info *info)
 
 /*
  * documentation related to the ACPI device definition
- * https://ww1.microchip.com/downloads/aemDocuments/documents/OTH/ApplicationNotes/ApplicationNotes/PAC1934-Integration-Notes-for-Microsoft-Windows-10-and-Windows-11-Driver-Support-DS00002534.pdf
+ * https://ww1.microchip.com/downloads/aemDocuments/documents/OTH/ApplicationNotes/ApplicationNotes/PAC193X-Integration-Notes-for-Microsoft-Windows-10-and-Windows-11-Driver-Support-DS00002534.pdf
  */
 static int pac1934_acpi_parse_channel_config(struct i2c_client *client,
 					     struct pac1934_chip_info *info)
@@ -1512,7 +1507,7 @@ static int pac1934_probe(struct i2c_client *client)
 		indio_dev->name = pac1934_chip_config[ret].name;
 	}
 
-	if (acpi_match_device(dev->driver->acpi_match_table, dev))
+	if (is_acpi_device_node(dev_fwnode(dev)))
 		ret = pac1934_acpi_parse_channel_config(client, info);
 	else
 		/*
@@ -1576,7 +1571,7 @@ static const struct i2c_device_id pac1934_id[] = {
 	{ .name = "pac1932", .driver_data = (kernel_ulong_t)&pac1934_chip_config[PAC1932] },
 	{ .name = "pac1933", .driver_data = (kernel_ulong_t)&pac1934_chip_config[PAC1933] },
 	{ .name = "pac1934", .driver_data = (kernel_ulong_t)&pac1934_chip_config[PAC1934] },
-	{}
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, pac1934_id);
 
@@ -1597,7 +1592,7 @@ static const struct of_device_id pac1934_of_match[] = {
 		.compatible = "microchip,pac1934",
 		.data = &pac1934_chip_config[PAC1934]
 	},
-	{}
+	{ }
 };
 MODULE_DEVICE_TABLE(of, pac1934_of_match);
 
@@ -1607,7 +1602,7 @@ MODULE_DEVICE_TABLE(of, pac1934_of_match);
  */
 static const struct acpi_device_id pac1934_acpi_match[] = {
 	{ "MCHP1930", .driver_data = (kernel_ulong_t)&pac1934_chip_config[PAC1934] },
-	{}
+	{ }
 };
 MODULE_DEVICE_TABLE(acpi, pac1934_acpi_match);
 

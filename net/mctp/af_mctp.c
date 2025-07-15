@@ -486,6 +486,9 @@ static int mctp_ioctl_droptag(struct mctp_sock *msk, bool tagv2,
 	tag = ctl.tag & MCTP_TAG_MASK;
 	rc = -EINVAL;
 
+	if (ctl.peer_addr == MCTP_ADDR_NULL)
+		ctl.peer_addr = MCTP_ADDR_ANY;
+
 	spin_lock_irqsave(&net->mctp.keys_lock, flags);
 	hlist_for_each_entry_safe(key, tmp, &msk->keys, sklist) {
 		/* we do an irqsave here, even though we know the irq state,
@@ -627,6 +630,9 @@ static int mctp_sk_hash(struct sock *sk)
 {
 	struct net *net = sock_net(sk);
 
+	/* Bind lookup runs under RCU, remain live during that. */
+	sock_set_flag(sk, SOCK_RCU_FREE);
+
 	mutex_lock(&net->mctp.bind_lock);
 	sk_add_node_rcu(sk, &net->mctp.binds);
 	mutex_unlock(&net->mctp.bind_lock);
@@ -660,7 +666,7 @@ static void mctp_sk_unhash(struct sock *sk)
 	 * keys), stop any pending expiry events. the timer cannot be re-queued
 	 * as the sk is no longer observable
 	 */
-	del_timer_sync(&msk->key_expiry);
+	timer_delete_sync(&msk->key_expiry);
 }
 
 static void mctp_sk_destruct(struct sock *sk)
@@ -753,10 +759,14 @@ static __init int mctp_init(void)
 	if (rc)
 		goto err_unreg_routes;
 
-	mctp_device_init();
+	rc = mctp_device_init();
+	if (rc)
+		goto err_unreg_neigh;
 
 	return 0;
 
+err_unreg_neigh:
+	mctp_neigh_exit();
 err_unreg_routes:
 	mctp_routes_exit();
 err_unreg_proto:

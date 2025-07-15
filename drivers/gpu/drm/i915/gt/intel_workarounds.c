@@ -111,9 +111,8 @@ static void wa_init_finish(struct i915_wa_list *wal)
 {
 	/* Trim unused entries. */
 	if (!IS_ALIGNED(wal->count, WA_LIST_CHUNK)) {
-		struct i915_wa *list = kmemdup(wal->list,
-					       wal->count * sizeof(*list),
-					       GFP_KERNEL);
+		struct i915_wa *list = kmemdup_array(wal->list, wal->count,
+						     sizeof(*list), GFP_KERNEL);
 
 		if (list) {
 			kfree(wal->list);
@@ -157,7 +156,7 @@ static void _wa_add(struct i915_wa_list *wal, const struct i915_wa *wa)
 	if (IS_ALIGNED(wal->count, grow)) { /* Either uninitialized or full. */
 		struct i915_wa *list;
 
-		list = kmalloc_array(ALIGN(wal->count + 1, grow), sizeof(*wa),
+		list = kmalloc_array(ALIGN(wal->count + 1, grow), sizeof(*list),
 				     GFP_KERNEL);
 		if (!list) {
 			drm_err(&i915->drm, "No space for workaround init!\n");
@@ -419,7 +418,7 @@ static void bdw_ctx_workarounds_init(struct intel_engine_cs *engine,
 		     /* WaForceContextSaveRestoreNonCoherent:bdw */
 		     HDC_FORCE_CONTEXT_SAVE_RESTORE_NON_COHERENT |
 		     /* WaDisableFenceDestinationToSLM:bdw (pre-prod) */
-		     (IS_BROADWELL_GT3(i915) ? HDC_FENCE_DEST_SLM_DISABLE : 0));
+		     (INTEL_INFO(i915)->gt == 3 ? HDC_FENCE_DEST_SLM_DISABLE : 0));
 }
 
 static void chv_ctx_workarounds_init(struct intel_engine_cs *engine,
@@ -692,16 +691,17 @@ static void gen12_ctx_workarounds_init(struct intel_engine_cs *engine,
 	struct drm_i915_private *i915 = engine->i915;
 
 	/*
-	 * Wa_1409142259:tgl,dg1,adl-p
+	 * Wa_1409142259:tgl,dg1,adl-p,adl-n
 	 * Wa_1409347922:tgl,dg1,adl-p
 	 * Wa_1409252684:tgl,dg1,adl-p
 	 * Wa_1409217633:tgl,dg1,adl-p
 	 * Wa_1409207793:tgl,dg1,adl-p
-	 * Wa_1409178076:tgl,dg1,adl-p
-	 * Wa_1408979724:tgl,dg1,adl-p
-	 * Wa_14010443199:tgl,rkl,dg1,adl-p
-	 * Wa_14010698770:tgl,rkl,dg1,adl-s,adl-p
-	 * Wa_1409342910:tgl,rkl,dg1,adl-s,adl-p
+	 * Wa_1409178076:tgl,dg1,adl-p,adl-n
+	 * Wa_1408979724:tgl,dg1,adl-p,adl-n
+	 * Wa_14010443199:tgl,rkl,dg1,adl-p,adl-n
+	 * Wa_14010698770:tgl,rkl,dg1,adl-s,adl-p,adl-n
+	 * Wa_1409342910:tgl,rkl,dg1,adl-s,adl-p,adl-n
+	 * Wa_22010465259:tgl,rkl,dg1,adl-s,adl-p,adl-n
 	 */
 	wa_masked_en(wal, GEN11_COMMON_SLICE_CHICKEN3,
 		     GEN12_DISABLE_CPS_AWARE_COLOR_PIPE);
@@ -742,6 +742,12 @@ static void gen12_ctx_workarounds_init(struct intel_engine_cs *engine,
 		/* Wa_1606376872 */
 		wa_masked_en(wal, COMMON_SLICE_CHICKEN4, DISABLE_TDC_LOAD_BALANCING_CALC);
 	}
+
+	/*
+	 * This bit must be set to enable performance optimization for fast
+	 * clears.
+	 */
+	wa_mcr_write_or(wal, GEN8_WM_CHICKEN2, WAIT_ON_DEPTH_STALL_DONE_DISABLE);
 }
 
 static void dg1_ctx_workarounds_init(struct intel_engine_cs *engine,
@@ -974,7 +980,12 @@ int intel_engine_emit_ctx_wa(struct i915_request *rq)
 	if (ret)
 		return ret;
 
-	cs = intel_ring_begin(rq, (wal->count * 2 + 2));
+	if ((IS_GFX_GT_IP_RANGE(rq->engine->gt, IP_VER(12, 70), IP_VER(12, 74)) ||
+	     IS_DG2(rq->i915)) && rq->engine->class == RENDER_CLASS)
+		cs = intel_ring_begin(rq, (wal->count * 2 + 6));
+	else
+		cs = intel_ring_begin(rq, (wal->count * 2 + 2));
+
 	if (IS_ERR(cs))
 		return PTR_ERR(cs);
 
@@ -1003,6 +1014,15 @@ int intel_engine_emit_ctx_wa(struct i915_request *rq)
 		*cs++ = val;
 	}
 	*cs++ = MI_NOOP;
+
+	/* Wa_14019789679 */
+	if ((IS_GFX_GT_IP_RANGE(rq->engine->gt, IP_VER(12, 70), IP_VER(12, 74)) ||
+	     IS_DG2(rq->i915)) && rq->engine->class == RENDER_CLASS) {
+		*cs++ = CMD_3DSTATE_MESH_CONTROL;
+		*cs++ = 0;
+		*cs++ = 0;
+		*cs++ = MI_NOOP;
+	}
 
 	intel_uncore_forcewake_put__locked(uncore, fw);
 	spin_unlock(&uncore->lock);
@@ -1305,7 +1325,7 @@ xehp_init_mcr(struct intel_gt *gt, struct i915_wa_list *wal)
 	 * We'll do our default/implicit steering based on GSLICE (in the
 	 * sliceid field) and DSS (in the subsliceid field).  If we can
 	 * find overlap between the valid MSLICE and/or LNCF values with
-	 * a suitable GSLICE, then we can just re-use the default value and
+	 * a suitable GSLICE, then we can just reuse the default value and
 	 * skip and explicit steering at runtime.
 	 *
 	 * We only need to look for overlap between GSLICE/MSLICE/LNCF to find
@@ -1589,6 +1609,14 @@ xelpmp_gt_workarounds_init(struct intel_gt *gt, struct i915_wa_list *wal)
 	 * GT, the media GT's versions are regular singleton registers.
 	 */
 	wa_write_or(wal, XELPMP_GSC_MOD_CTRL, FORCE_MISS_FTLB);
+
+	/*
+	 * Wa_14018575942
+	 *
+	 * Issue is seen on media KPI test running on VDBOX engine
+	 * especially VP9 encoding WLs
+	 */
+	wa_write_or(wal, XELPMP_VDBX_MOD_CTRL, FORCE_MISS_FTLB);
 
 	/* Wa_22016670082 */
 	wa_write_or(wal, GEN12_SQCNT1, GEN12_STRICT_RAR_ENABLE);
@@ -2050,7 +2078,7 @@ static void dg2_whitelist_build(struct intel_engine_cs *engine)
 	case RENDER_CLASS:
 		/* Required by recommended tuning setting (not a workaround) */
 		whitelist_mcr_reg(w, XEHP_COMMON_SLICE_CHICKEN3);
-
+		whitelist_reg(w, GEN7_COMMON_SLICE_CHICKEN1);
 		break;
 	default:
 		break;
@@ -2065,7 +2093,7 @@ static void xelpg_whitelist_build(struct intel_engine_cs *engine)
 	case RENDER_CLASS:
 		/* Required by recommended tuning setting (not a workaround) */
 		whitelist_mcr_reg(w, XEHP_COMMON_SLICE_CHICKEN3);
-
+		whitelist_reg(w, GEN7_COMMON_SLICE_CHICKEN1);
 		break;
 	default:
 		break;
@@ -2276,6 +2304,15 @@ rcs_engine_wa_init(struct intel_engine_cs *engine, struct i915_wa_list *wal)
 			     RING_PSMI_CTL(RENDER_RING_BASE),
 			     GEN12_WAIT_FOR_EVENT_POWER_DOWN_DISABLE |
 			     GEN8_RC_SEMA_IDLE_MSG_DISABLE);
+	}
+
+	if (IS_JASPERLAKE(i915) || IS_ELKHARTLAKE(i915)) {
+		/*
+		 * "Disable Repacking for Compression (masked R/W access)
+		 *  before rendering compressed surfaces for display."
+		 */
+		wa_masked_en(wal, CACHE_MODE_0_GEN7,
+			     DISABLE_REPACKING_FOR_COMPRESSION);
 	}
 
 	if (GRAPHICS_VER(i915) == 11) {
@@ -2516,7 +2553,7 @@ rcs_engine_wa_init(struct intel_engine_cs *engine, struct i915_wa_list *wal)
 				 GEN7_FF_DS_SCHED_HW);
 
 		/* WaDisablePSDDualDispatchEnable:ivb */
-		if (IS_IVB_GT1(i915))
+		if (INTEL_INFO(i915)->gt == 1)
 			wa_masked_en(wal,
 				     GEN7_HALF_SLICE_CHICKEN1,
 				     GEN7_PSD_SINGLE_PORT_DISPATCH_ENABLE);

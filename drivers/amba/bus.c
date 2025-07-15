@@ -26,7 +26,7 @@
 #include <linux/iommu.h>
 #include <linux/dma-map-ops.h>
 
-#define to_amba_driver(d)	container_of(d, struct amba_driver, drv)
+#define to_amba_driver(d)	container_of_const(d, struct amba_driver, drv)
 
 /* called on periphid match and class 0x9 coresight device. */
 static int
@@ -205,10 +205,10 @@ err_out:
 	return ret;
 }
 
-static int amba_match(struct device *dev, struct device_driver *drv)
+static int amba_match(struct device *dev, const struct device_driver *drv)
 {
 	struct amba_device *pcdev = to_amba_device(dev);
-	struct amba_driver *pcdrv = to_amba_driver(drv);
+	const struct amba_driver *pcdrv = to_amba_driver(drv);
 
 	mutex_lock(&pcdev->periphid_lock);
 	if (!pcdev->periphid) {
@@ -364,7 +364,8 @@ static int amba_dma_configure(struct device *dev)
 		ret = acpi_dma_configure(dev, attr);
 	}
 
-	if (!ret && !drv->driver_managed_dma) {
+	/* @drv may not be valid when we're called from the IOMMU layer */
+	if (!ret && dev->driver && !drv->driver_managed_dma) {
 		ret = iommu_device_use_default_domain(dev);
 		if (ret)
 			arch_teardown_dma_ops(dev);
@@ -435,7 +436,7 @@ static const struct dev_pm_ops amba_pm = {
  * DMA configuration for platform and AMBA bus is same. So here we reuse
  * platform's DMA config routine.
  */
-struct bus_type amba_bustype = {
+const struct bus_type amba_bustype = {
 	.name		= "amba",
 	.dev_groups	= amba_dev_groups,
 	.match		= amba_match,
@@ -448,6 +449,12 @@ struct bus_type amba_bustype = {
 	.pm		= &amba_pm,
 };
 EXPORT_SYMBOL_GPL(amba_bustype);
+
+bool dev_is_amba(const struct device *dev)
+{
+	return dev->bus == &amba_bustype;
+}
+EXPORT_SYMBOL_GPL(dev_is_amba);
 
 static int __init amba_init(void)
 {

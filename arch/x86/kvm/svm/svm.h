@@ -25,7 +25,21 @@
 #include "cpuid.h"
 #include "kvm_cache_regs.h"
 
-#define __sme_page_pa(x) __sme_set(page_to_pfn(x) << PAGE_SHIFT)
+/*
+ * Helpers to convert to/from physical addresses for pages whose address is
+ * consumed directly by hardware.  Even though it's a physical address, SVM
+ * often restricts the address to the natural width, hence 'unsigned long'
+ * instead of 'hpa_t'.
+ */
+static inline unsigned long __sme_page_pa(struct page *page)
+{
+	return __sme_set(page_to_pfn(page) << PAGE_SHIFT);
+}
+
+static inline struct page *__sme_pa_to_page(unsigned long pa)
+{
+	return pfn_to_page(__sme_clr(pa) >> PAGE_SHIFT);
+}
 
 #define	IOPM_SIZE PAGE_SIZE * 3
 #define	MSRPM_SIZE PAGE_SIZE * 2
@@ -84,6 +98,7 @@ struct kvm_sev_info {
 	unsigned int asid;	/* ASID used for this guest */
 	unsigned int handle;	/* SEV firmware handle */
 	int fd;			/* SEV device fd */
+	unsigned long policy;
 	unsigned long pages_locked; /* Number of pages locked */
 	struct list_head regions_list;  /* List of registered regions */
 	u64 ap_jump_table;	/* SEV-ES AP Jump Table address */
@@ -94,7 +109,14 @@ struct kvm_sev_info {
 	struct list_head mirror_entry; /* Use as a list entry of mirrors */
 	struct misc_cg *misc_cg; /* For misc cgroup accounting */
 	atomic_t migration_in_progress;
+	void *snp_context;      /* SNP guest context page */
+	void *guest_req_buf;    /* Bounce buffer for SNP Guest Request input */
+	void *guest_resp_buf;   /* Bounce buffer for SNP Guest Request output */
+	struct mutex guest_req_mutex; /* Must acquire before using bounce buffers */
 };
+
+#define SEV_POLICY_NODBG	BIT_ULL(0)
+#define SNP_POLICY_DEBUG	BIT_ULL(19)
 
 struct kvm_svm {
 	struct kvm kvm;
@@ -151,6 +173,7 @@ struct vmcb_ctrl_area_cached {
 	u64 nested_cr3;
 	u64 virt_ext;
 	u32 clean;
+	u64 bus_lock_rip;
 	union {
 #if IS_ENABLED(CONFIG_HYPERV) || IS_ENABLED(CONFIG_KVM_HYPERV)
 		struct hv_vmcb_enlightenments hv_enlightenments;
@@ -209,6 +232,18 @@ struct vcpu_sev_es_state {
 	u32 ghcb_sa_len;
 	bool ghcb_sa_sync;
 	bool ghcb_sa_free;
+
+	/* SNP Page-State-Change buffer entries currently being processed */
+	u16 psc_idx;
+	u16 psc_inflight;
+	bool psc_2m;
+
+	u64 ghcb_registered_gpa;
+
+	struct mutex snp_vmsa_mutex; /* Used to handle concurrent updates of VMSA. */
+	gpa_t snp_vmsa_gpa;
+	bool snp_ap_waiting_for_reset;
+	bool snp_has_guest_vmsa;
 };
 
 struct vcpu_svm {
@@ -305,10 +340,10 @@ struct svm_cpu_data {
 	u32 next_asid;
 	u32 min_asid;
 
-	struct page *save_area;
-	unsigned long save_area_pa;
+	bool bp_spec_reduce_set;
 
-	struct vmcb *current_vmcb;
+	struct vmcb *save_area;
+	unsigned long save_area_pa;
 
 	/* index = sev_asid, value = vmcb pointer */
 	struct vmcb **sev_vmcbs;
@@ -328,26 +363,34 @@ static __always_inline struct kvm_sev_info *to_kvm_sev_info(struct kvm *kvm)
 	return &to_kvm_svm(kvm)->sev_info;
 }
 
+#ifdef CONFIG_KVM_AMD_SEV
 static __always_inline bool sev_guest(struct kvm *kvm)
 {
-#ifdef CONFIG_KVM_AMD_SEV
-	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
-
-	return sev->active;
-#else
-	return false;
-#endif
+	return to_kvm_sev_info(kvm)->active;
 }
-
 static __always_inline bool sev_es_guest(struct kvm *kvm)
 {
-#ifdef CONFIG_KVM_AMD_SEV
-	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
 
 	return sev->es_active && !WARN_ON_ONCE(!sev->active);
+}
+
+static __always_inline bool sev_snp_guest(struct kvm *kvm)
+{
+	struct kvm_sev_info *sev = to_kvm_sev_info(kvm);
+
+	return (sev->vmsa_features & SVM_SEV_FEAT_SNP_ACTIVE) &&
+	       !WARN_ON_ONCE(!sev_es_guest(kvm));
+}
 #else
-	return false;
+#define sev_guest(kvm) false
+#define sev_es_guest(kvm) false
+#define sev_snp_guest(kvm) false
 #endif
+
+static inline bool ghcb_gpa_is_registered(struct vcpu_svm *svm, u64 val)
+{
+	return svm->sev_es.ghcb_registered_gpa == val;
 }
 
 static inline void vmcb_mark_all_dirty(struct vmcb *vmcb)
@@ -455,7 +498,7 @@ static inline bool svm_is_intercept(struct vcpu_svm *svm, int bit)
 
 static inline bool nested_vgif_enabled(struct vcpu_svm *svm)
 {
-	return guest_can_use(&svm->vcpu, X86_FEATURE_VGIF) &&
+	return guest_cpu_cap_has(&svm->vcpu, X86_FEATURE_VGIF) &&
 	       (svm->nested.ctl.int_ctl & V_GIF_ENABLE_MASK);
 }
 
@@ -507,7 +550,7 @@ static inline bool nested_npt_enabled(struct vcpu_svm *svm)
 
 static inline bool nested_vnmi_enabled(struct vcpu_svm *svm)
 {
-	return guest_can_use(&svm->vcpu, X86_FEATURE_VNMI) &&
+	return guest_cpu_cap_has(&svm->vcpu, X86_FEATURE_VNMI) &&
 	       (svm->nested.ctl.int_ctl & V_NMI_ENABLE_MASK);
 }
 
@@ -541,10 +584,39 @@ static inline bool is_vnmi_enabled(struct vcpu_svm *svm)
 		return false;
 }
 
+static inline void svm_vmgexit_set_return_code(struct vcpu_svm *svm,
+						u64 response, u64 data)
+{
+	ghcb_set_sw_exit_info_1(svm->sev_es.ghcb, response);
+	ghcb_set_sw_exit_info_2(svm->sev_es.ghcb, data);
+}
+
+static inline void svm_vmgexit_inject_exception(struct vcpu_svm *svm, u8 vector)
+{
+	u64 data = SVM_EVTINJ_VALID | SVM_EVTINJ_TYPE_EXEPT | vector;
+
+	svm_vmgexit_set_return_code(svm, GHCB_HV_RESP_ISSUE_EXCEPTION, data);
+}
+
+static inline void svm_vmgexit_bad_input(struct vcpu_svm *svm, u64 suberror)
+{
+	svm_vmgexit_set_return_code(svm, GHCB_HV_RESP_MALFORMED_INPUT, suberror);
+}
+
+static inline void svm_vmgexit_success(struct vcpu_svm *svm, u64 data)
+{
+	svm_vmgexit_set_return_code(svm, GHCB_HV_RESP_NO_ACTION, data);
+}
+
+static inline void svm_vmgexit_no_action(struct vcpu_svm *svm, u64 data)
+{
+	svm_vmgexit_set_return_code(svm, GHCB_HV_RESP_NO_ACTION, data);
+}
+
 /* svm.c */
 #define MSR_INVALID				0xffffffffU
 
-#define DEBUGCTL_RESERVED_BITS (~(0x3fULL))
+#define DEBUGCTL_RESERVED_BITS (~DEBUGCTLMSR_LBR)
 
 extern bool dump_invalid_vmcb;
 
@@ -638,7 +710,7 @@ extern struct kvm_x86_nested_ops svm_nested_ops;
 /* avic.c */
 #define AVIC_REQUIRED_APICV_INHIBITS			\
 (							\
-	BIT(APICV_INHIBIT_REASON_DISABLE) |		\
+	BIT(APICV_INHIBIT_REASON_DISABLED) |		\
 	BIT(APICV_INHIBIT_REASON_ABSENT) |		\
 	BIT(APICV_INHIBIT_REASON_HYPERV) |		\
 	BIT(APICV_INHIBIT_REASON_NESTED) |		\
@@ -675,7 +747,7 @@ void avic_refresh_virtual_apic_mode(struct kvm_vcpu *vcpu);
 
 /* sev.c */
 
-void pre_sev_run(struct vcpu_svm *svm, int cpu);
+int pre_sev_run(struct vcpu_svm *svm, int cpu);
 void sev_init_vmcb(struct vcpu_svm *svm);
 void sev_vcpu_after_set_cpuid(struct vcpu_svm *svm);
 int sev_es_string_io(struct vcpu_svm *svm, int size, unsigned int port, int in);
@@ -696,7 +768,13 @@ void sev_guest_memory_reclaimed(struct kvm *kvm);
 int sev_handle_vmgexit(struct kvm_vcpu *vcpu);
 
 /* These symbols are used in common code and are stubbed below.  */
-struct page *snp_safe_alloc_page(struct kvm_vcpu *vcpu);
+
+struct page *snp_safe_alloc_page_node(int node, gfp_t gfp);
+static inline struct page *snp_safe_alloc_page(void)
+{
+	return snp_safe_alloc_page_node(numa_node_id(), GFP_KERNEL_ACCOUNT);
+}
+
 void sev_free_vcpu(struct kvm_vcpu *vcpu);
 void sev_vm_destroy(struct kvm *kvm);
 void __init sev_set_cpu_caps(void);
@@ -705,9 +783,22 @@ void sev_hardware_unsetup(void);
 int sev_cpu_init(struct svm_cpu_data *sd);
 int sev_dev_get_attr(u32 group, u64 attr, u64 *val);
 extern unsigned int max_sev_asid;
+void sev_handle_rmp_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code);
+void sev_snp_init_protected_guest_state(struct kvm_vcpu *vcpu);
+int sev_gmem_prepare(struct kvm *kvm, kvm_pfn_t pfn, gfn_t gfn, int max_order);
+void sev_gmem_invalidate(kvm_pfn_t start, kvm_pfn_t end);
+int sev_private_max_mapping_level(struct kvm *kvm, kvm_pfn_t pfn);
+struct vmcb_save_area *sev_decrypt_vmsa(struct kvm_vcpu *vcpu);
+void sev_free_decrypted_vmsa(struct kvm_vcpu *vcpu, struct vmcb_save_area *vmsa);
 #else
-static inline struct page *snp_safe_alloc_page(struct kvm_vcpu *vcpu) {
-	return alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+static inline struct page *snp_safe_alloc_page_node(int node, gfp_t gfp)
+{
+	return alloc_pages_node(node, gfp | __GFP_ZERO, 0);
+}
+
+static inline struct page *snp_safe_alloc_page(void)
+{
+	return snp_safe_alloc_page_node(numa_node_id(), GFP_KERNEL_ACCOUNT);
 }
 
 static inline void sev_free_vcpu(struct kvm_vcpu *vcpu) {}
@@ -718,6 +809,23 @@ static inline void sev_hardware_unsetup(void) {}
 static inline int sev_cpu_init(struct svm_cpu_data *sd) { return 0; }
 static inline int sev_dev_get_attr(u32 group, u64 attr, u64 *val) { return -ENXIO; }
 #define max_sev_asid 0
+static inline void sev_handle_rmp_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code) {}
+static inline void sev_snp_init_protected_guest_state(struct kvm_vcpu *vcpu) {}
+static inline int sev_gmem_prepare(struct kvm *kvm, kvm_pfn_t pfn, gfn_t gfn, int max_order)
+{
+	return 0;
+}
+static inline void sev_gmem_invalidate(kvm_pfn_t start, kvm_pfn_t end) {}
+static inline int sev_private_max_mapping_level(struct kvm *kvm, kvm_pfn_t pfn)
+{
+	return 0;
+}
+
+static inline struct vmcb_save_area *sev_decrypt_vmsa(struct kvm_vcpu *vcpu)
+{
+	return NULL;
+}
+static inline void sev_free_decrypted_vmsa(struct kvm_vcpu *vcpu, struct vmcb_save_area *vmsa) {}
 #endif
 
 /* vmenter.S */

@@ -100,16 +100,19 @@ struct bpf_prog_load_opts {
 	__u32 log_level;
 	__u32 log_size;
 	char *log_buf;
-	/* output: actual total log contents size (including termintaing zero).
+	/* output: actual total log contents size (including terminating zero).
 	 * It could be both larger than original log_size (if log was
 	 * truncated), or smaller (if log buffer wasn't filled completely).
 	 * If kernel doesn't support this feature, log_size is left unchanged.
 	 */
 	__u32 log_true_size;
 	__u32 token_fd;
+
+	/* if set, provides the length of fd_array */
+	__u32 fd_array_cnt;
 	size_t :0;
 };
-#define bpf_prog_load_opts__last_field token_fd
+#define bpf_prog_load_opts__last_field fd_array_cnt
 
 LIBBPF_API int bpf_prog_load(enum bpf_prog_type prog_type,
 			     const char *prog_name, const char *license,
@@ -129,7 +132,7 @@ struct bpf_btf_load_opts {
 	char *log_buf;
 	__u32 log_level;
 	__u32 log_size;
-	/* output: actual total log contents size (including termintaing zero).
+	/* output: actual total log contents size (including terminating zero).
 	 * It could be both larger than original log_size (if log was
 	 * truncated), or smaller (if log buffer wasn't filled completely).
 	 * If kernel doesn't support this feature, log_size is left unchanged.
@@ -484,9 +487,10 @@ LIBBPF_API int bpf_link_get_next_id(__u32 start_id, __u32 *next_id);
 struct bpf_get_fd_by_id_opts {
 	size_t sz; /* size of this struct for forward/backward compatibility */
 	__u32 open_flags; /* permissions requested for the operation on fd */
+	__u32 token_fd;
 	size_t :0;
 };
-#define bpf_get_fd_by_id_opts__last_field open_flags
+#define bpf_get_fd_by_id_opts__last_field token_fd
 
 LIBBPF_API int bpf_prog_get_fd_by_id(__u32 id);
 LIBBPF_API int bpf_prog_get_fd_by_id_opts(__u32 id,

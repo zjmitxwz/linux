@@ -7,6 +7,7 @@
 
 #include "adf_accel_devices.h"
 #include "adf_cfg_common.h"
+#include "adf_dc.h"
 
 /* PCIe configuration space */
 #define ADF_GEN4_BAR_MASK	(BIT(0) | BIT(2) | BIT(4))
@@ -83,7 +84,7 @@
 #define ADF_WQM_CSR_RPRESETSTS(bank)	(ADF_WQM_CSR_RPRESETCTL(bank) + 4)
 
 /* Ring interrupt */
-#define ADF_RP_INT_SRC_SEL_F_RISE_MASK	BIT(2)
+#define ADF_RP_INT_SRC_SEL_F_RISE_MASK	GENMASK(1, 0)
 #define ADF_RP_INT_SRC_SEL_F_FALL_MASK	GENMASK(2, 0)
 #define ADF_RP_INT_SRC_SEL_RANGE_WIDTH	4
 #define ADF_COALESCED_POLL_TIMEOUT_US	(1 * USEC_PER_SEC)
@@ -179,5 +180,7 @@ int adf_gen4_bank_state_save(struct adf_accel_dev *accel_dev, u32 bank_number,
 			     struct bank_state *state);
 int adf_gen4_bank_state_restore(struct adf_accel_dev *accel_dev,
 				u32 bank_number, struct bank_state *state);
+bool adf_gen4_services_supported(unsigned long service_mask);
+void adf_gen4_init_dc_ops(struct adf_dc_ops *dc_ops);
 
 #endif

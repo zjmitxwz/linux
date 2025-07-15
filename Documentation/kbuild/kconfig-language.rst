@@ -70,7 +70,11 @@ applicable everywhere (see syntax).
 
   Every menu entry can have at most one prompt, which is used to display
   to the user. Optionally dependencies only for this prompt can be added
-  with "if".
+  with "if". If a prompt is not present, the config option is a non-visible
+  symbol, meaning its value cannot be directly changed by the user (such as
+  altering the value in ``.config``) and the option will not appear in any
+  config menus. Its value can only be set via "default" and "select" (see
+  below).
 
 - default value: "default" <expr> ["if" <expr>]
 
@@ -189,16 +193,6 @@ applicable everywhere (see syntax).
   This is useful e.g. with multiple drivers that want to indicate their
   ability to hook into a secondary subsystem while allowing the user to
   configure that subsystem out without also having to unset these drivers.
-
-  Note: If the combination of FOO=y and BAZ=m causes a link error,
-  you can guard the function call with IS_REACHABLE()::
-
-	foo_init()
-	{
-		if (IS_REACHABLE(CONFIG_BAZ))
-			baz_register(&foo);
-		...
-	}
 
   Note: If the feature provided by BAZ is highly desirable for FOO,
   FOO should imply not only BAZ, but also its dependency BAR::
@@ -408,17 +402,10 @@ choices::
 	<choice block>
 	"endchoice"
 
-This defines a choice group and accepts any of the above attributes as
-options. A choice can only be of type bool or tristate.  If no type is
-specified for a choice, its type will be determined by the type of
-the first choice element in the group or remain unknown if none of the
-choice elements have a type specified, as well.
+This defines a choice group and accepts "prompt", "default", "depends on", and
+"help" attributes as options.
 
-While a boolean choice only allows a single config entry to be
-selected, a tristate choice also allows any number of config entries
-to be set to 'm'. This can be used if multiple drivers for a single
-hardware exists and only a single driver can be compiled/loaded into
-the kernel, but all drivers can be compiled as modules.
+A choice only allows a single config entry to be selected.
 
 comment::
 
@@ -591,7 +578,9 @@ uses the slightly counterintuitive::
 	depends on BAR || !BAR
 
 This means that there is either a dependency on BAR that disallows
-the combination of FOO=y with BAR=m, or BAR is completely disabled.
+the combination of FOO=y with BAR=m, or BAR is completely disabled. The BAR
+module must provide all the stubs for !BAR case.
+
 For a more formalized approach if there are multiple drivers that have
 the same dependency, a helper symbol can be used, like::
 
@@ -601,6 +590,21 @@ the same dependency, a helper symbol can be used, like::
 
   config BAR_OPTIONAL
 	def_tristate BAR || !BAR
+
+Much less favorable way to express optional dependency is IS_REACHABLE() within
+the module code, useful for example when the module BAR does not provide
+!BAR stubs::
+
+	foo_init()
+	{
+		if (IS_REACHABLE(CONFIG_BAR))
+			bar_register(&foo);
+		...
+	}
+
+IS_REACHABLE() is generally discouraged, because the code will be silently
+discarded, when CONFIG_BAR=m and this code is built-in. This is not what users
+usually expect when enabling BAR as module.
 
 Kconfig recursive dependency limitations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

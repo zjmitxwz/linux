@@ -74,8 +74,7 @@ struct lpfc_sli2_slim;
  * queue depths when there are driver resource error or Firmware
  * resource error.
  */
-/* 1 Second */
-#define QUEUE_RAMP_DOWN_INTERVAL	(msecs_to_jiffies(1000 * 1))
+#define QUEUE_RAMP_DOWN_INTERVAL	(secs_to_jiffies(1))
 
 /* Number of exchanges reserved for discovery to complete */
 #define LPFC_DISC_IOCB_BUFF_COUNT 20
@@ -306,6 +305,14 @@ struct lpfc_stats {
 
 struct lpfc_hba;
 
+/* Data structure to keep withheld FLOGI_ACC information */
+struct lpfc_defer_flogi_acc {
+	bool flag;
+	u16 rx_id;
+	u16 ox_id;
+	struct lpfc_nodelist *ndlp;
+
+};
 
 #define LPFC_VMID_TIMER   300	/* timer interval in seconds */
 
@@ -1430,9 +1437,7 @@ struct lpfc_hba {
 	uint16_t vlan_id;
 	struct list_head fcf_conn_rec_list;
 
-	bool defer_flogi_acc_flag;
-	uint16_t defer_flogi_acc_rx_id;
-	uint16_t defer_flogi_acc_ox_id;
+	struct lpfc_defer_flogi_acc defer_flogi_acc;
 
 	spinlock_t ct_ev_lock; /* synchronize access to ct_ev_waiters */
 	struct list_head ct_ev_waiters;
@@ -1709,18 +1714,12 @@ lpfc_phba_elsring(struct lpfc_hba *phba)
  * Note: If no valid cpu found, then nr_cpu_ids is returned.
  *
  **/
-static inline unsigned int
+static __always_inline unsigned int
 lpfc_next_online_cpu(const struct cpumask *mask, unsigned int start)
 {
-	unsigned int cpu_it;
-
-	for_each_cpu_wrap(cpu_it, mask, start) {
-		if (cpu_online(cpu_it))
-			break;
-	}
-
-	return cpu_it;
+	return cpumask_next_and_wrap(start, mask, cpu_online_mask);
 }
+
 /**
  * lpfc_next_present_cpu - Finds next present CPU after n
  * @n: the cpu prior to search
@@ -1728,16 +1727,9 @@ lpfc_next_online_cpu(const struct cpumask *mask, unsigned int start)
  * Note: If no next present cpu, then fallback to first present cpu.
  *
  **/
-static inline unsigned int lpfc_next_present_cpu(int n)
+static __always_inline unsigned int lpfc_next_present_cpu(int n)
 {
-	unsigned int cpu;
-
-	cpu = cpumask_next(n, cpu_present_mask);
-
-	if (cpu >= nr_cpu_ids)
-		cpu = cpumask_first(cpu_present_mask);
-
-	return cpu;
+	return cpumask_next_wrap(n, cpu_present_mask);
 }
 
 /**

@@ -126,7 +126,6 @@ static const char * const clock_names[SYSC_MAX_CLOCKS] = {
  * @enabled: sysc runtime enabled status
  * @needs_resume: runtime resume needed on resume from suspend
  * @child_needs_resume: runtime resume needed for child on resume from suspend
- * @disable_on_idle: status flag used for disabling modules with resets
  * @idle_work: work structure used to perform delayed idle on a module
  * @pre_reset_quirk: module specific pre-reset quirk
  * @post_reset_quirk: module specific post-reset quirk
@@ -678,51 +677,6 @@ static int sysc_parse_and_check_child_range(struct sysc *ddata)
 	return 0;
 }
 
-/* Interconnect instances to probe before l4_per instances */
-static struct resource early_bus_ranges[] = {
-	/* am3/4 l4_wkup */
-	{ .start = 0x44c00000, .end = 0x44c00000 + 0x300000, },
-	/* omap4/5 and dra7 l4_cfg */
-	{ .start = 0x4a000000, .end = 0x4a000000 + 0x300000, },
-	/* omap4 l4_wkup */
-	{ .start = 0x4a300000, .end = 0x4a300000 + 0x30000,  },
-	/* omap5 and dra7 l4_wkup without dra7 dcan segment */
-	{ .start = 0x4ae00000, .end = 0x4ae00000 + 0x30000,  },
-};
-
-static atomic_t sysc_defer = ATOMIC_INIT(10);
-
-/**
- * sysc_defer_non_critical - defer non_critical interconnect probing
- * @ddata: device driver data
- *
- * We want to probe l4_cfg and l4_wkup interconnect instances before any
- * l4_per instances as l4_per instances depend on resources on l4_cfg and
- * l4_wkup interconnects.
- */
-static int sysc_defer_non_critical(struct sysc *ddata)
-{
-	struct resource *res;
-	int i;
-
-	if (!atomic_read(&sysc_defer))
-		return 0;
-
-	for (i = 0; i < ARRAY_SIZE(early_bus_ranges); i++) {
-		res = &early_bus_ranges[i];
-		if (ddata->module_pa >= res->start &&
-		    ddata->module_pa <= res->end) {
-			atomic_set(&sysc_defer, 0);
-
-			return 0;
-		}
-	}
-
-	atomic_dec_if_positive(&sysc_defer);
-
-	return -EPROBE_DEFER;
-}
-
 static struct device_node *stdout_path;
 
 static void sysc_init_stdout_path(struct sysc *ddata)
@@ -945,10 +899,6 @@ static int sysc_map_and_check_registers(struct sysc *ddata)
 	int error;
 
 	error = sysc_parse_and_check_child_range(ddata);
-	if (error)
-		return error;
-
-	error = sysc_defer_non_critical(ddata);
 	if (error)
 		return error;
 
@@ -2037,6 +1987,21 @@ static void sysc_module_disable_quirk_pruss(struct sysc *ddata)
 	sysc_write(ddata, ddata->offsets[SYSC_SYSCONFIG], reg);
 }
 
+static void sysc_module_enable_quirk_pruss(struct sysc *ddata)
+{
+	u32 reg;
+
+	reg = sysc_read(ddata, ddata->offsets[SYSC_SYSCONFIG]);
+
+	/*
+	 * Clearing the SYSC_PRUSS_STANDBY_INIT bit - Updates OCP master
+	 * port configuration to enable memory access outside of the
+	 * PRU-ICSS subsystem.
+	 */
+	reg &= (~SYSC_PRUSS_STANDBY_INIT);
+	sysc_write(ddata, ddata->offsets[SYSC_SYSCONFIG], reg);
+}
+
 static void sysc_init_module_quirks(struct sysc *ddata)
 {
 	if (ddata->legacy_mode || !ddata->name)
@@ -2089,8 +2054,10 @@ static void sysc_init_module_quirks(struct sysc *ddata)
 		ddata->module_disable_quirk = sysc_reset_done_quirk_wdt;
 	}
 
-	if (ddata->cfg.quirks & SYSC_MODULE_QUIRK_PRUSS)
+	if (ddata->cfg.quirks & SYSC_MODULE_QUIRK_PRUSS) {
+		ddata->module_enable_quirk = sysc_module_enable_quirk_pruss;
 		ddata->module_disable_quirk = sysc_module_disable_quirk_pruss;
+	}
 }
 
 static int sysc_clockdomain_init(struct sysc *ddata)
@@ -2291,11 +2258,9 @@ static int sysc_init_idlemode(struct sysc *ddata, u8 *idlemodes,
 			      const char *name)
 {
 	struct device_node *np = ddata->dev->of_node;
-	struct property *prop;
-	const __be32 *p;
 	u32 val;
 
-	of_property_for_each_u32(np, name, prop, p, val) {
+	of_property_for_each_u32(np, name, val) {
 		if (val >= SYSC_NR_IDLEMODES) {
 			dev_err(ddata->dev, "invalid idlemode: %i\n", val);
 			return -EINVAL;
@@ -2571,14 +2536,12 @@ static const struct sysc_dts_quirk sysc_dts_quirks[] = {
 static void sysc_parse_dts_quirks(struct sysc *ddata, struct device_node *np,
 				  bool is_child)
 {
-	const struct property *prop;
-	int i, len;
+	int i;
 
 	for (i = 0; i < ARRAY_SIZE(sysc_dts_quirks); i++) {
 		const char *name = sysc_dts_quirks[i].name;
 
-		prop = of_get_property(np, name, &len);
-		if (!prop)
+		if (!of_property_present(np, name))
 			continue;
 
 		ddata->cfg.quirks |= sysc_dts_quirks[i].mask;
@@ -3350,7 +3313,7 @@ MODULE_DEVICE_TABLE(of, sysc_match);
 
 static struct platform_driver sysc_driver = {
 	.probe		= sysc_probe,
-	.remove_new	= sysc_remove,
+	.remove		= sysc_remove,
 	.driver         = {
 		.name   = "ti-sysc",
 		.of_match_table	= sysc_match,

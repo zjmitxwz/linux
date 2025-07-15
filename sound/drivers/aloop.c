@@ -261,7 +261,7 @@ static int loopback_snd_timer_start(struct loopback_pcm *dpcm)
 /* call in cable->lock */
 static inline int loopback_jiffies_timer_stop(struct loopback_pcm *dpcm)
 {
-	del_timer(&dpcm->timer);
+	timer_delete(&dpcm->timer);
 	dpcm->timer.expires = 0;
 
 	return 0;
@@ -292,7 +292,7 @@ static int loopback_snd_timer_stop(struct loopback_pcm *dpcm)
 
 static inline int loopback_jiffies_timer_stop_sync(struct loopback_pcm *dpcm)
 {
-	del_timer_sync(&dpcm->timer);
+	timer_delete_sync(&dpcm->timer);
 
 	return 0;
 }
@@ -699,7 +699,7 @@ static unsigned int loopback_jiffies_timer_pos_update
 
 static void loopback_jiffies_timer_function(struct timer_list *t)
 {
-	struct loopback_pcm *dpcm = from_timer(dpcm, t, timer);
+	struct loopback_pcm *dpcm = timer_container_of(dpcm, t, timer);
 	unsigned long flags;
 
 	spin_lock_irqsave(&dpcm->cable->lock, flags);
@@ -900,8 +900,7 @@ static void loopback_snd_timer_dpcm_info(struct loopback_pcm *dpcm,
 		    cable->snd_timer.id.device,
 		    cable->snd_timer.id.subdevice);
 	snd_iprintf(buffer, "    timer open:\t\t%s\n",
-		    (cable->snd_timer.stream == SNDRV_PCM_STREAM_CAPTURE) ?
-			    "capture" : "playback");
+		    snd_pcm_direction_name(cable->snd_timer.stream));
 }
 
 static snd_pcm_uframes_t loopback_pointer(struct snd_pcm_substream *substream)
@@ -1130,6 +1129,8 @@ static int loopback_parse_timer_id(const char *str,
 			}
 		}
 	}
+	if (card_idx == -1)
+		tid->dev_class = SNDRV_TIMER_CLASS_GLOBAL;
 	if (!err && tid) {
 		tid->card = card_idx;
 		tid->device = dev;
@@ -1897,7 +1898,7 @@ static int __init alsa_card_loopback_init(void)
 	}
 	if (!cards) {
 #ifdef MODULE
-		printk(KERN_ERR "aloop: No loopback enabled\n");
+		pr_err("aloop: No loopback enabled\n");
 #endif
 		loopback_unregister_all();
 		return -ENODEV;

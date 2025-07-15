@@ -4,6 +4,7 @@
 # Direct Rendering Infrastructure (DRI) in XFree86 4.1.0 and higher.
 
 ast-y := \
+	ast_cursor.o \
 	ast_ddc.o \
 	ast_dp501.o \
 	ast_dp.o \
@@ -11,6 +12,9 @@ ast-y := \
 	ast_main.o \
 	ast_mm.o \
 	ast_mode.o \
-	ast_post.o
+	ast_post.o \
+	ast_sil164.o \
+	ast_vbios.o \
+	ast_vga.o
 
 obj-$(CONFIG_DRM_AST) := ast.o

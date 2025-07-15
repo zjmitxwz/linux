@@ -2000,7 +2000,7 @@ mtk_wed_configure_irq(struct mtk_wed_device *dev, u32 irq_mask)
 		if (mtk_wed_is_v3_or_greater(dev->hw))
 			wed_set(dev, MTK_WED_CTRL, MTK_WED_CTRL_TX_TKID_ALI_EN);
 
-		/* initail tx interrupt trigger */
+		/* initial tx interrupt trigger */
 		wed_w32(dev, MTK_WED_WPDMA_INT_CTRL_TX,
 			MTK_WED_WPDMA_INT_CTRL_TX0_DONE_EN |
 			MTK_WED_WPDMA_INT_CTRL_TX0_DONE_CLR |
@@ -2011,7 +2011,7 @@ mtk_wed_configure_irq(struct mtk_wed_device *dev, u32 irq_mask)
 			FIELD_PREP(MTK_WED_WPDMA_INT_CTRL_TX1_DONE_TRIG,
 				   dev->wlan.tx_tbit[1]));
 
-		/* initail txfree interrupt trigger */
+		/* initial txfree interrupt trigger */
 		wed_w32(dev, MTK_WED_WPDMA_INT_CTRL_TX_FREE,
 			MTK_WED_WPDMA_INT_CTRL_TX_FREE_DONE_EN |
 			MTK_WED_WPDMA_INT_CTRL_TX_FREE_DONE_CLR |
@@ -2666,14 +2666,15 @@ mtk_wed_setup_tc_block_cb(enum tc_setup_type type, void *type_data, void *cb_pri
 {
 	struct mtk_wed_flow_block_priv *priv = cb_priv;
 	struct flow_cls_offload *cls = type_data;
-	struct mtk_wed_hw *hw = priv->hw;
+	struct mtk_wed_hw *hw = NULL;
 
-	if (!tc_can_offload(priv->dev))
+	if (!priv || !tc_can_offload(priv->dev))
 		return -EOPNOTSUPP;
 
 	if (type != TC_SETUP_CLSFLOWER)
 		return -EOPNOTSUPP;
 
+	hw = priv->hw;
 	return mtk_flow_offload_cmd(hw->eth, cls, hw->index);
 }
 
@@ -2729,6 +2730,7 @@ mtk_wed_setup_tc_block(struct mtk_wed_hw *hw, struct net_device *dev,
 			flow_block_cb_remove(block_cb, f);
 			list_del(&block_cb->driver_list);
 			kfree(block_cb->cb_priv);
+			block_cb->cb_priv = NULL;
 		}
 		return 0;
 	default:

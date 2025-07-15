@@ -61,38 +61,36 @@ extern const int sysctl_vals[];
 
 extern const unsigned long sysctl_long_vals[];
 
-typedef int proc_handler(struct ctl_table *ctl, int write, void *buffer,
+typedef int proc_handler(const struct ctl_table *ctl, int write, void *buffer,
 		size_t *lenp, loff_t *ppos);
 
-int proc_dostring(struct ctl_table *, int, void *, size_t *, loff_t *);
-int proc_dobool(struct ctl_table *table, int write, void *buffer,
+int proc_dostring(const struct ctl_table *, int, void *, size_t *, loff_t *);
+int proc_dobool(const struct ctl_table *table, int write, void *buffer,
 		size_t *lenp, loff_t *ppos);
-int proc_dointvec(struct ctl_table *, int, void *, size_t *, loff_t *);
-int proc_douintvec(struct ctl_table *, int, void *, size_t *, loff_t *);
-int proc_dointvec_minmax(struct ctl_table *, int, void *, size_t *, loff_t *);
-int proc_douintvec_minmax(struct ctl_table *table, int write, void *buffer,
+int proc_dointvec(const struct ctl_table *, int, void *, size_t *, loff_t *);
+int proc_douintvec(const struct ctl_table *, int, void *, size_t *, loff_t *);
+int proc_dointvec_minmax(const struct ctl_table *, int, void *, size_t *, loff_t *);
+int proc_douintvec_minmax(const struct ctl_table *table, int write, void *buffer,
 		size_t *lenp, loff_t *ppos);
-int proc_dou8vec_minmax(struct ctl_table *table, int write, void *buffer,
+int proc_dou8vec_minmax(const struct ctl_table *table, int write, void *buffer,
 			size_t *lenp, loff_t *ppos);
-int proc_dointvec_jiffies(struct ctl_table *, int, void *, size_t *, loff_t *);
-int proc_dointvec_ms_jiffies_minmax(struct ctl_table *table, int write,
+int proc_dointvec_jiffies(const struct ctl_table *, int, void *, size_t *, loff_t *);
+int proc_dointvec_ms_jiffies_minmax(const struct ctl_table *table, int write,
 		void *buffer, size_t *lenp, loff_t *ppos);
-int proc_dointvec_userhz_jiffies(struct ctl_table *, int, void *, size_t *,
+int proc_dointvec_userhz_jiffies(const struct ctl_table *, int, void *, size_t *,
 		loff_t *);
-int proc_dointvec_ms_jiffies(struct ctl_table *, int, void *, size_t *,
+int proc_dointvec_ms_jiffies(const struct ctl_table *, int, void *, size_t *,
 		loff_t *);
-int proc_doulongvec_minmax(struct ctl_table *, int, void *, size_t *, loff_t *);
-int proc_doulongvec_ms_jiffies_minmax(struct ctl_table *table, int, void *,
+int proc_doulongvec_minmax(const struct ctl_table *, int, void *, size_t *, loff_t *);
+int proc_doulongvec_ms_jiffies_minmax(const struct ctl_table *table, int, void *,
 		size_t *, loff_t *);
-int proc_do_large_bitmap(struct ctl_table *, int, void *, size_t *, loff_t *);
-int proc_do_static_key(struct ctl_table *table, int write, void *buffer,
+int proc_do_large_bitmap(const struct ctl_table *, int, void *, size_t *, loff_t *);
+int proc_do_static_key(const struct ctl_table *table, int write, void *buffer,
 		size_t *lenp, loff_t *ppos);
 
 /*
  * Register a set of sysctl names by calling register_sysctl
- * with an initialised array of struct ctl_table's.  An entry with 
- * NULL procname terminates the table.  table->de will be
- * set up by the registration and need not be initialised in advance.
+ * with an initialised array of struct ctl_table's.
  *
  * sysctl names can be mirrored automatically under /proc/sys.  The
  * procname supplied controls /proc naming.
@@ -133,7 +131,7 @@ static inline void *proc_sys_poll_event(struct ctl_table_poll *poll)
 
 /* A sysctl table is an array of struct ctl_table: */
 struct ctl_table {
-	const char *procname;		/* Text ID for /proc/sys, or zero */
+	const char *procname;		/* Text ID for /proc/sys */
 	void *data;
 	int maxlen;
 	umode_t mode;
@@ -162,7 +160,7 @@ struct ctl_node {
 struct ctl_table_header {
 	union {
 		struct {
-			struct ctl_table *ctl_table;
+			const struct ctl_table *ctl_table;
 			int ctl_table_size;
 			int used;
 			int count;
@@ -223,13 +221,13 @@ extern void retire_sysctl_set(struct ctl_table_set *set);
 
 struct ctl_table_header *__register_sysctl_table(
 	struct ctl_table_set *set,
-	const char *path, struct ctl_table *table, size_t table_size);
-struct ctl_table_header *register_sysctl_sz(const char *path, struct ctl_table *table,
+	const char *path, const struct ctl_table *table, size_t table_size);
+struct ctl_table_header *register_sysctl_sz(const char *path, const struct ctl_table *table,
 					    size_t table_size);
 void unregister_sysctl_table(struct ctl_table_header * table);
 
 extern int sysctl_init_bases(void);
-extern void __register_sysctl_init(const char *path, struct ctl_table *table,
+extern void __register_sysctl_init(const char *path, const struct ctl_table *table,
 				 const char *table_name, size_t table_size);
 #define register_sysctl_init(path, table)	\
 	__register_sysctl_init(path, table, #table, ARRAY_SIZE(table))
@@ -237,7 +235,7 @@ extern struct ctl_table_header *register_sysctl_mount_point(const char *path);
 
 void do_sysctl_args(void);
 bool sysctl_is_alias(char *param);
-int do_proc_douintvec(struct ctl_table *table, int write,
+int do_proc_douintvec(const struct ctl_table *table, int write,
 		      void *buffer, size_t *lenp, loff_t *ppos,
 		      int (*conv)(unsigned long *lvalp,
 				  unsigned int *valp,
@@ -251,7 +249,7 @@ extern int no_unaligned_warning;
 
 #else /* CONFIG_SYSCTL */
 
-static inline void register_sysctl_init(const char *path, struct ctl_table *table)
+static inline void register_sysctl_init(const char *path, const struct ctl_table *table)
 {
 }
 
@@ -261,7 +259,7 @@ static inline struct ctl_table_header *register_sysctl_mount_point(const char *p
 }
 
 static inline struct ctl_table_header *register_sysctl_sz(const char *path,
-							  struct ctl_table *table,
+							  const struct ctl_table *table,
 							  size_t table_size)
 {
 	return NULL;
@@ -287,7 +285,7 @@ static inline bool sysctl_is_alias(char *param)
 }
 #endif /* CONFIG_SYSCTL */
 
-int sysctl_max_threads(struct ctl_table *table, int write, void *buffer,
+int sysctl_max_threads(const struct ctl_table *table, int write, void *buffer,
 		size_t *lenp, loff_t *ppos);
 
 #endif /* _LINUX_SYSCTL_H */

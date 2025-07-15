@@ -15,13 +15,14 @@
 
 #ifdef CONFIG_STACKLEAK_RUNTIME_DISABLE
 #include <linux/jump_label.h>
+#include <linux/string_choices.h>
 #include <linux/sysctl.h>
 #include <linux/init.h>
 
 static DEFINE_STATIC_KEY_FALSE(stack_erasing_bypass);
 
 #ifdef CONFIG_SYSCTL
-static int stack_erasing_sysctl(struct ctl_table *table, int write,
+static int stack_erasing_sysctl(const struct ctl_table *table, int write,
 			void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	int ret = 0;
@@ -41,10 +42,10 @@ static int stack_erasing_sysctl(struct ctl_table *table, int write,
 		static_branch_enable(&stack_erasing_bypass);
 
 	pr_warn("stackleak: kernel stack erasing is %s\n",
-					state ? "enabled" : "disabled");
+					str_enabled_disabled(state));
 	return ret;
 }
-static struct ctl_table stackleak_sysctls[] = {
+static const struct ctl_table stackleak_sysctls[] = {
 	{
 		.procname	= "stack_erasing",
 		.data		= NULL,

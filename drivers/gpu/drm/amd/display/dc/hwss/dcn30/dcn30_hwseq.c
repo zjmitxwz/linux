@@ -74,6 +74,7 @@ void dcn30_log_color_state(struct dc *dc,
 {
 	struct dc_context *dc_ctx = dc->ctx;
 	struct resource_pool *pool = dc->res_pool;
+	bool is_gamut_remap_available = false;
 	int i;
 
 	DTN_INFO("DPP:  DGAM ROM  DGAM ROM type  DGAM LUT  SHAPER mode"
@@ -88,16 +89,16 @@ void dcn30_log_color_state(struct dc *dc,
 		struct dcn_dpp_state s = {0};
 
 		dpp->funcs->dpp_read_state(dpp, &s);
-		dpp->funcs->dpp_get_gamut_remap(dpp, &s.gamut_remap);
+
+		if (dpp->funcs->dpp_get_gamut_remap) {
+			dpp->funcs->dpp_get_gamut_remap(dpp, &s.gamut_remap);
+			is_gamut_remap_available = true;
+		}
 
 		if (!s.is_enabled)
 			continue;
 
-		DTN_INFO("[%2d]:  %7x  %13s  %8s  %11s  %10s  %15s  %10s  %9s"
-			 "  %12s  "
-			 "%010lld %010lld %010lld %010lld "
-			 "%010lld %010lld %010lld %010lld "
-			 "%010lld %010lld %010lld %010lld",
+		DTN_INFO("[%2d]:  %7x  %13s  %8s  %11s  %10s  %15s  %10s  %9s",
 			dpp->inst,
 			s.pre_dgam_mode,
 			(s.pre_dgam_select == 0) ? "sRGB" :
@@ -121,7 +122,14 @@ void dcn30_log_color_state(struct dc *dc,
 			(s.lut3d_size == 0) ? "17x17x17" : "9x9x9",
 			(s.rgam_lut_mode == 0) ? "Bypass" :
 			 ((s.rgam_lut_mode == 1) ? "RAM A" :
-						   "RAM B"),
+						   "RAM B"));
+
+		if (is_gamut_remap_available) {
+			DTN_INFO("  %12s  "
+				 "%010lld %010lld %010lld %010lld "
+				 "%010lld %010lld %010lld %010lld "
+				 "%010lld %010lld %010lld %010lld",
+
 			(s.gamut_remap.gamut_adjust_type == 0) ? "Bypass" :
 				((s.gamut_remap.gamut_adjust_type == 1) ? "HW" :
 									  "SW"),
@@ -137,6 +145,8 @@ void dcn30_log_color_state(struct dc *dc,
 			s.gamut_remap.temperature_matrix[9].value,
 			s.gamut_remap.temperature_matrix[10].value,
 			s.gamut_remap.temperature_matrix[11].value);
+		}
+
 		DTN_INFO("\n");
 	}
 	DTN_INFO("\n");
@@ -228,8 +238,11 @@ bool dcn30_set_blend_lut(
 	if (plane_state->blend_tf.type == TF_TYPE_HWPWL)
 		blend_lut = &plane_state->blend_tf.pwl;
 	else if (plane_state->blend_tf.type == TF_TYPE_DISTRIBUTED_POINTS) {
-		cm3_helper_translate_curve_to_hw_format(
+		result = cm3_helper_translate_curve_to_hw_format(
 				&plane_state->blend_tf, &dpp_base->regamma_params, false);
+		if (!result)
+			return result;
+
 		blend_lut = &dpp_base->regamma_params;
 	}
 	result = dpp_base->funcs->dpp_program_blnd_lut(dpp_base, blend_lut);
@@ -242,6 +255,7 @@ static bool dcn30_set_mpc_shaper_3dlut(struct pipe_ctx *pipe_ctx,
 {
 	struct dpp *dpp_base = pipe_ctx->plane_res.dpp;
 	int mpcc_id = pipe_ctx->plane_res.hubp->inst;
+	struct dc *dc = pipe_ctx->stream->ctx->dc;
 	struct mpc *mpc = pipe_ctx->stream_res.opp->ctx->dc->res_pool->mpc;
 	bool result = false;
 	int acquired_rmu = 0;
@@ -280,8 +294,14 @@ static bool dcn30_set_mpc_shaper_3dlut(struct pipe_ctx *pipe_ctx,
 
 		result = mpc->funcs->program_3dlut(mpc, &stream->lut3d_func->lut_3d,
 						   stream->lut3d_func->state.bits.rmu_mux_num);
+		if (!result)
+			DC_LOG_ERROR("%s: program_3dlut failed\n", __func__);
+
 		result = mpc->funcs->program_shaper(mpc, shaper_lut,
 						    stream->lut3d_func->state.bits.rmu_mux_num);
+		if (!result)
+			DC_LOG_ERROR("%s: program_shaper failed\n", __func__);
+
 	} else {
 		// loop through the available mux and release the requested mpcc_id
 		mpc->funcs->release_rmu(mpc, mpcc_id);
@@ -395,7 +415,11 @@ bool dcn30_set_output_transfer_func(struct dc *dc,
 		}
 	}
 
-	mpc->funcs->set_output_gamma(mpc, mpcc_id, params);
+	if (mpc->funcs->set_output_gamma)
+		mpc->funcs->set_output_gamma(mpc, mpcc_id, params);
+	else
+		DC_LOG_ERROR("%s: set_output_gamma function pointer is NULL.\n", __func__);
+
 	return ret;
 }
 
@@ -448,7 +472,7 @@ bool dcn30_mmhubbub_warmup(
 	struct mcif_wb *mcif_wb;
 	struct mcif_warmup_params warmup_params = {0};
 	unsigned int  i, i_buf;
-	/*make sure there is no active DWB eanbled */
+	/* make sure there is no active DWB enabled */
 	for (i = 0; i < num_dwb; i++) {
 		dwb = dc->res_pool->dwbc[wb_info[i].dwb_pipe_inst];
 		if (dwb->dwb_is_efc_transition || dwb->dwb_is_drc) {
@@ -479,7 +503,6 @@ bool dcn30_mmhubbub_warmup(
 	}
 	/*following is the original: warmup each DWB's mcif buffer*/
 	for (i = 0; i < num_dwb; i++) {
-		dwb = dc->res_pool->dwbc[wb_info[i].dwb_pipe_inst];
 		mcif_wb = dc->res_pool->mcif_wb[wb_info[i].dwb_pipe_inst];
 		/*warmup is for VM mode only*/
 		if (wb_info[i].mcif_buf_params.p_vmid == 0)
@@ -622,7 +645,7 @@ void dcn30_init_hw(struct dc *dc)
 	uint32_t backlight = MAX_BACKLIGHT_LEVEL;
 	uint32_t user_level = MAX_BACKLIGHT_LEVEL;
 
-	if (dc->clk_mgr && dc->clk_mgr->funcs->init_clocks)
+	if (dc->clk_mgr && dc->clk_mgr->funcs && dc->clk_mgr->funcs->init_clocks)
 		dc->clk_mgr->funcs->init_clocks(dc->clk_mgr);
 
 	// Initialize the dccg
@@ -656,7 +679,7 @@ void dcn30_init_hw(struct dc *dc)
 		res_pool->ref_clocks.xtalin_clock_inKhz =
 				dc->ctx->dc_bios->fw_info.pll_info.crystal_frequency;
 
-		if (res_pool->dccg && res_pool->hubbub) {
+		if (res_pool->hubbub) {
 
 			(res_pool->dccg->funcs->get_dccg_ref_freq)(res_pool->dccg,
 					dc->ctx->dc_bios->fw_info.pll_info.crystal_frequency,
@@ -728,10 +751,10 @@ void dcn30_init_hw(struct dc *dc)
 		if (edp_link && edp_link->link_enc->funcs->is_dig_enabled &&
 				edp_link->link_enc->funcs->is_dig_enabled(edp_link->link_enc) &&
 				dc->hwss.edp_backlight_control &&
-				dc->hwss.power_down &&
+				hws->funcs.power_down &&
 				dc->hwss.edp_power_control) {
 			dc->hwss.edp_backlight_control(edp_link, false);
-			dc->hwss.power_down(dc);
+			hws->funcs.power_down(dc);
 			dc->hwss.edp_power_control(edp_link, false);
 		} else {
 			for (i = 0; i < dc->link_count; i++) {
@@ -739,8 +762,8 @@ void dcn30_init_hw(struct dc *dc)
 
 				if (link->link_enc->funcs->is_dig_enabled &&
 						link->link_enc->funcs->is_dig_enabled(link->link_enc) &&
-						dc->hwss.power_down) {
-					dc->hwss.power_down(dc);
+						hws->funcs.power_down) {
+					hws->funcs.power_down(dc);
 					break;
 				}
 
@@ -783,11 +806,12 @@ void dcn30_init_hw(struct dc *dc)
 	if (!dcb->funcs->is_accelerated_mode(dcb) && dc->res_pool->hubbub->funcs->init_watermarks)
 		dc->res_pool->hubbub->funcs->init_watermarks(dc->res_pool->hubbub);
 
-	if (dc->clk_mgr->funcs->notify_wm_ranges)
+	if (dc->clk_mgr && dc->clk_mgr->funcs && dc->clk_mgr->funcs->notify_wm_ranges)
 		dc->clk_mgr->funcs->notify_wm_ranges(dc->clk_mgr);
 
 	//if softmax is enabled then hardmax will be set by a different call
-	if (dc->clk_mgr->funcs->set_hard_max_memclk && !dc->clk_mgr->dc_mode_softmax_enabled)
+	if (dc->clk_mgr && dc->clk_mgr->funcs && dc->clk_mgr->funcs->set_hard_max_memclk &&
+	    !dc->clk_mgr->dc_mode_softmax_enabled)
 		dc->clk_mgr->funcs->set_hard_max_memclk(dc->clk_mgr);
 
 	if (dc->res_pool->hubbub->funcs->force_pstate_change_control)
@@ -919,6 +943,9 @@ bool dcn30_apply_idle_power_optimizations(struct dc *dc, bool enable)
 			stream = dc->current_state->streams[0];
 			plane = (stream ? dc->current_state->stream_status[0].plane_states[0] : NULL);
 
+			if (!stream || !plane)
+				return false;
+
 			if (stream && plane) {
 				cursor_cache_enable = stream->cursor_position.enable &&
 						plane->address.grph.cursor_cache_addr.quad_part;
@@ -1038,7 +1065,7 @@ bool dcn30_apply_idle_power_optimizations(struct dc *dc, bool enable)
 
 					/* Use copied cursor, and it's okay to not switch back */
 					cursor_attr.address.quad_part = cmd.mall.cursor_copy_dst.quad_part;
-					dc_stream_set_cursor_attributes(stream, &cursor_attr);
+					dc_stream_program_cursor_attributes(stream, &cursor_attr);
 				}
 
 				/* Enable MALL */
@@ -1173,4 +1200,31 @@ void dcn30_prepare_bandwidth(struct dc *dc,
 
 	if (!dc->clk_mgr->clks.fw_based_mclk_switching)
 		dc_dmub_srv_p_state_delegate(dc, false, context);
+}
+
+void dcn30_wait_for_all_pending_updates(const struct pipe_ctx *pipe_ctx)
+{
+	struct timing_generator *tg = pipe_ctx->stream_res.tg;
+	bool pending_updates = false;
+	unsigned int i;
+
+	if (tg && tg->funcs->is_tg_enabled(tg)) {
+		// Poll for 100ms maximum
+		for (i = 0; i < 100000; i++) {
+			pending_updates = false;
+			if (tg->funcs->get_optc_double_buffer_pending)
+				pending_updates |= tg->funcs->get_optc_double_buffer_pending(tg);
+
+			if (tg->funcs->get_otg_double_buffer_pending)
+				pending_updates |= tg->funcs->get_otg_double_buffer_pending(tg);
+
+			if (tg->funcs->get_pipe_update_pending && pipe_ctx->plane_state)
+				pending_updates |= tg->funcs->get_pipe_update_pending(tg);
+
+			if (!pending_updates)
+				break;
+
+			udelay(1);
+		}
+	}
 }

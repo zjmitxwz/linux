@@ -80,6 +80,7 @@ static void build_deinstantiation_desc(u32 *desc, int handle)
 	append_jump(desc, JUMP_CLASS_CLASS1 | JUMP_TYPE_HALT);
 }
 
+#ifdef CONFIG_OF
 static const struct of_device_id imx8m_machine_match[] = {
 	{ .compatible = "fsl,imx8mm", },
 	{ .compatible = "fsl,imx8mn", },
@@ -88,6 +89,7 @@ static const struct of_device_id imx8m_machine_match[] = {
 	{ .compatible = "fsl,imx8ulp", },
 	{ }
 };
+#endif
 
 /*
  * run_descriptor_deco0 - runs a descriptor on DECO0, under direct control of
@@ -571,6 +573,7 @@ static const struct soc_device_attribute caam_imx_soc_table[] = {
 	{ .soc_id = "i.MX7*",  .data = &caam_imx7_data },
 	{ .soc_id = "i.MX8M*", .data = &caam_imx7_data },
 	{ .soc_id = "i.MX8ULP", .data = &caam_imx8ulp_data },
+	{ .soc_id = "i.MX8QM", .data = &caam_imx8ulp_data },
 	{ .soc_id = "VF*",     .data = &caam_vf610_data },
 	{ .family = "Freescale i.MX" },
 	{ /* sentinel */ }

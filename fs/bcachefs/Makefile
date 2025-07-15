@@ -29,18 +29,20 @@ bcachefs-y		:=	\
 	clock.o			\
 	compress.o		\
 	darray.o		\
+	data_update.o		\
 	debug.o			\
 	dirent.o		\
+	disk_accounting.o	\
 	disk_groups.o		\
-	data_update.o		\
 	ec.o			\
+	enumerated_ref.o	\
 	errcode.o		\
 	error.o			\
 	extents.o		\
 	extent_update.o		\
 	eytzinger.o		\
+	fast_list.o		\
 	fs.o			\
-	fs-common.o		\
 	fs-ioctl.o		\
 	fs-io.o			\
 	fs-io-buffered.o	\
@@ -63,11 +65,14 @@ bcachefs-y		:=	\
 	migrate.o		\
 	move.o			\
 	movinggc.o		\
+	namei.o			\
 	nocow_locking.o		\
 	opts.o			\
 	printbuf.o		\
+	progress.o		\
 	quota.o			\
 	rebalance.o		\
+	rcu_pending.o		\
 	recovery.o		\
 	recovery_passes.o	\
 	reflink.o		\
@@ -80,6 +85,7 @@ bcachefs-y		:=	\
 	siphash.o		\
 	six.o			\
 	snapshot.o		\
+	str_hash.o		\
 	subvolume.o		\
 	super.o			\
 	super-io.o		\
@@ -92,6 +98,8 @@ bcachefs-y		:=	\
 	util.o			\
 	varint.o		\
 	xattr.o
+
+bcachefs-$(CONFIG_BCACHEFS_ASYNC_OBJECT_LISTS)   += async_objs.o
 
 obj-$(CONFIG_MEAN_AND_VARIANCE_UNIT_TEST)   += mean_and_variance_test.o
 

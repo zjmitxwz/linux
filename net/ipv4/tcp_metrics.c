@@ -170,7 +170,7 @@ static struct tcp_metrics_block *tcpm_new(struct dst_entry *dst,
 	bool reclaim = false;
 
 	spin_lock_bh(&tcp_metrics_lock);
-	net = dev_net(dst->dev);
+	net = dev_net_rcu(dst->dev);
 
 	/* While waiting for the spin-lock the cache might have been populated
 	 * with this entry and so we have to check again.
@@ -273,7 +273,7 @@ static struct tcp_metrics_block *__tcp_get_metrics_req(struct request_sock *req,
 		return NULL;
 	}
 
-	net = dev_net(dst->dev);
+	net = dev_net_rcu(dst->dev);
 	hash ^= net_hash_mix(net);
 	hash = hash_32(hash, tcp_metrics_hash_log);
 
@@ -318,7 +318,7 @@ static struct tcp_metrics_block *tcp_get_metrics(struct sock *sk,
 	else
 		return NULL;
 
-	net = dev_net(dst->dev);
+	net = dev_net_rcu(dst->dev);
 	hash ^= net_hash_mix(net);
 	hash = hash_32(hash, tcp_metrics_hash_log);
 
@@ -617,8 +617,13 @@ static struct genl_family tcp_metrics_nl_family;
 
 static const struct nla_policy tcp_metrics_nl_policy[TCP_METRICS_ATTR_MAX + 1] = {
 	[TCP_METRICS_ATTR_ADDR_IPV4]	= { .type = NLA_U32, },
-	[TCP_METRICS_ATTR_ADDR_IPV6]	= { .type = NLA_BINARY,
-					    .len = sizeof(struct in6_addr), },
+	[TCP_METRICS_ATTR_ADDR_IPV6]	=
+		NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
+
+	[TCP_METRICS_ATTR_SADDR_IPV4]	= { .type = NLA_U32, },
+	[TCP_METRICS_ATTR_SADDR_IPV6]	=
+		NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
+
 	/* Following attributes are not received for GET/DEL,
 	 * we keep them for reference
 	 */
@@ -810,8 +815,6 @@ static int __parse_nl_addr(struct genl_info *info, struct inetpeer_addr *addr,
 	if (a) {
 		struct in6_addr in6;
 
-		if (nla_len(a) != sizeof(struct in6_addr))
-			return -EINVAL;
 		in6 = nla_get_in6_addr(a);
 		inetpeer_set_addr_v6(addr, &in6);
 		if (hash)

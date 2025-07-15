@@ -326,12 +326,6 @@ static const struct vb2_ops vimc_capture_qops = {
 	.buf_queue		= vimc_capture_buf_queue,
 	.queue_setup		= vimc_capture_queue_setup,
 	.buf_prepare		= vimc_capture_buffer_prepare,
-	/*
-	 * Since q->lock is set we can use the standard
-	 * vb2_ops_wait_prepare/finish helper functions.
-	 */
-	.wait_prepare		= vb2_ops_wait_prepare,
-	.wait_finish		= vb2_ops_wait_finish,
 };
 
 static const struct media_entity_operations vimc_capture_mops = {
@@ -494,7 +488,7 @@ err_free_vcapture:
 	return ERR_PTR(ret);
 }
 
-struct vimc_ent_type vimc_capture_type = {
+const struct vimc_ent_type vimc_capture_type = {
 	.add = vimc_capture_add,
 	.unregister = vimc_capture_unregister,
 	.release = vimc_capture_release

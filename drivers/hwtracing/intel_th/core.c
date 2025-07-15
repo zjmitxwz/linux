@@ -26,9 +26,9 @@ module_param(host_mode, bool, 0444);
 
 static DEFINE_IDA(intel_th_ida);
 
-static int intel_th_match(struct device *dev, struct device_driver *driver)
+static int intel_th_match(struct device *dev, const struct device_driver *driver)
 {
-	struct intel_th_driver *thdrv = to_intel_th_driver(driver);
+	const struct intel_th_driver *thdrv = to_intel_th_driver(driver);
 	struct intel_th_device *thdev = to_intel_th_device(dev);
 
 	if (thdev->type == INTEL_TH_SWITCH &&
@@ -857,8 +857,9 @@ static irqreturn_t intel_th_irq(int irq, void *data)
 /**
  * intel_th_alloc() - allocate a new Intel TH device and its subdevices
  * @dev:	parent device
+ * @drvdata:	data private to the driver
  * @devres:	resources indexed by th_mmio_idx
- * @irq:	irq number
+ * @ndevres:	number of entries in the @devres resources
  */
 struct intel_th *
 intel_th_alloc(struct device *dev, const struct intel_th_drvdata *drvdata,

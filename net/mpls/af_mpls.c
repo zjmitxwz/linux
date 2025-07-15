@@ -81,8 +81,8 @@ static struct mpls_route *mpls_route_input_rcu(struct net *net, unsigned index)
 
 	if (index < net->mpls.platform_labels) {
 		struct mpls_route __rcu **platform_label =
-			rcu_dereference(net->mpls.platform_label);
-		rt = rcu_dereference(platform_label[index]);
+			rcu_dereference_rtnl(net->mpls.platform_label);
+		rt = rcu_dereference_rtnl(platform_label[index]);
 	}
 	return rt;
 }
@@ -1201,8 +1201,7 @@ static void mpls_netconf_notify_devconf(struct net *net, int event,
 	rtnl_notify(skb, net, 0, RTNLGRP_MPLS_NETCONF, NULL, GFP_KERNEL);
 	return;
 errout:
-	if (err < 0)
-		rtnl_set_sk_err(net, RTNLGRP_MPLS_NETCONF, err);
+	rtnl_set_sk_err(net, RTNLGRP_MPLS_NETCONF, err);
 }
 
 static const struct nla_policy devconf_mpls_policy[NETCONFA_MAX + 1] = {
@@ -1347,7 +1346,7 @@ static int mpls_netconf_dump_devconf(struct sk_buff *skb,
 #define MPLS_PERDEV_SYSCTL_OFFSET(field)	\
 	(&((struct mpls_dev *)0)->field)
 
-static int mpls_conf_proc(struct ctl_table *ctl, int write,
+static int mpls_conf_proc(const struct ctl_table *ctl, int write,
 			  void *buffer, size_t *lenp, loff_t *ppos)
 {
 	int oval = *(int *)ctl->data;
@@ -1665,7 +1664,7 @@ static int nla_put_via(struct sk_buff *skb,
 		       u8 table, const void *addr, int alen)
 {
 	static const int table_to_family[NEIGH_NR_TABLES + 1] = {
-		AF_INET, AF_INET6, AF_DECnet, AF_PACKET,
+		AF_INET, AF_INET6, AF_PACKET,
 	};
 	struct nlattr *nla;
 	struct rtvia *via;
@@ -2096,12 +2095,12 @@ static int mpls_valid_fib_dump_req(struct net *net, const struct nlmsghdr *nlh,
 	struct rtmsg *rtm;
 	int err, i;
 
-	if (nlh->nlmsg_len < nlmsg_msg_size(sizeof(*rtm))) {
+	rtm = nlmsg_payload(nlh, sizeof(*rtm));
+	if (!rtm) {
 		NL_SET_ERR_MSG_MOD(extack, "Invalid header for FIB dump request");
 		return -EINVAL;
 	}
 
-	rtm = nlmsg_data(nlh);
 	if (rtm->rtm_dst_len || rtm->rtm_src_len  || rtm->rtm_tos   ||
 	    rtm->rtm_table   || rtm->rtm_scope    || rtm->rtm_type  ||
 	    rtm->rtm_flags) {
@@ -2278,8 +2277,7 @@ static void rtmsg_lfib(int event, u32 label, struct mpls_route *rt,
 
 	return;
 errout:
-	if (err < 0)
-		rtnl_set_sk_err(net, RTNLGRP_MPLS_ROUTE, err);
+	rtnl_set_sk_err(net, RTNLGRP_MPLS_ROUTE, err);
 }
 
 static int mpls_valid_getroute_req(struct sk_buff *skb,
@@ -2290,7 +2288,8 @@ static int mpls_valid_getroute_req(struct sk_buff *skb,
 	struct rtmsg *rtm;
 	int i, err;
 
-	if (nlh->nlmsg_len < nlmsg_msg_size(sizeof(*rtm))) {
+	rtm = nlmsg_payload(nlh, sizeof(*rtm));
+	if (!rtm) {
 		NL_SET_ERR_MSG_MOD(extack,
 				   "Invalid header for get route request");
 		return -EINVAL;
@@ -2300,7 +2299,6 @@ static int mpls_valid_getroute_req(struct sk_buff *skb,
 		return nlmsg_parse_deprecated(nlh, sizeof(*rtm), tb, RTA_MAX,
 					      rtm_mpls_policy, extack);
 
-	rtm = nlmsg_data(nlh);
 	if ((rtm->rtm_dst_len && rtm->rtm_dst_len != 20) ||
 	    rtm->rtm_src_len || rtm->rtm_tos || rtm->rtm_table ||
 	    rtm->rtm_protocol || rtm->rtm_scope || rtm->rtm_type) {
@@ -2600,7 +2598,7 @@ nolabels:
 	return -ENOMEM;
 }
 
-static int mpls_platform_labels(struct ctl_table *table, int write,
+static int mpls_platform_labels(const struct ctl_table *table, int write,
 				void *buffer, size_t *lenp, loff_t *ppos)
 {
 	struct net *net = table->data;
@@ -2730,6 +2728,15 @@ static struct rtnl_af_ops mpls_af_ops __read_mostly = {
 	.get_stats_af_size = mpls_get_stats_af_size,
 };
 
+static const struct rtnl_msg_handler mpls_rtnl_msg_handlers[] __initdata_or_module = {
+	{THIS_MODULE, PF_MPLS, RTM_NEWROUTE, mpls_rtm_newroute, NULL, 0},
+	{THIS_MODULE, PF_MPLS, RTM_DELROUTE, mpls_rtm_delroute, NULL, 0},
+	{THIS_MODULE, PF_MPLS, RTM_GETROUTE, mpls_getroute, mpls_dump_routes, 0},
+	{THIS_MODULE, PF_MPLS, RTM_GETNETCONF,
+	 mpls_netconf_get_devconf, mpls_netconf_dump_devconf,
+	 RTNL_FLAG_DUMP_UNLOCKED},
+};
+
 static int __init mpls_init(void)
 {
 	int err;
@@ -2746,26 +2753,30 @@ static int __init mpls_init(void)
 
 	dev_add_pack(&mpls_packet_type);
 
-	rtnl_af_register(&mpls_af_ops);
-
-	rtnl_register_module(THIS_MODULE, PF_MPLS, RTM_NEWROUTE,
-			     mpls_rtm_newroute, NULL, 0);
-	rtnl_register_module(THIS_MODULE, PF_MPLS, RTM_DELROUTE,
-			     mpls_rtm_delroute, NULL, 0);
-	rtnl_register_module(THIS_MODULE, PF_MPLS, RTM_GETROUTE,
-			     mpls_getroute, mpls_dump_routes, 0);
-	rtnl_register_module(THIS_MODULE, PF_MPLS, RTM_GETNETCONF,
-			     mpls_netconf_get_devconf,
-			     mpls_netconf_dump_devconf,
-			     RTNL_FLAG_DUMP_UNLOCKED);
-	err = ipgre_tunnel_encap_add_mpls_ops();
+	err = rtnl_af_register(&mpls_af_ops);
 	if (err)
+		goto out_unregister_dev_type;
+
+	err = rtnl_register_many(mpls_rtnl_msg_handlers);
+	if (err)
+		goto out_unregister_rtnl_af;
+
+	err = ipgre_tunnel_encap_add_mpls_ops();
+	if (err) {
 		pr_err("Can't add mpls over gre tunnel ops\n");
+		goto out_unregister_rtnl;
+	}
 
 	err = 0;
 out:
 	return err;
 
+out_unregister_rtnl:
+	rtnl_unregister_many(mpls_rtnl_msg_handlers);
+out_unregister_rtnl_af:
+	rtnl_af_unregister(&mpls_af_ops);
+out_unregister_dev_type:
+	dev_remove_pack(&mpls_packet_type);
 out_unregister_pernet:
 	unregister_pernet_subsys(&mpls_net_ops);
 	goto out;

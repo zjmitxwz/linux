@@ -9,6 +9,7 @@
 #include <linux/irqchip/chained_irq.h>
 #include <linux/interrupt.h>
 #include <linux/platform_device.h>
+#include <linux/string_choices.h>
 
 enum gio_reg_index {
 	GIO_REG_ODEN = 0,
@@ -224,7 +225,7 @@ static int brcmstb_gpio_priv_set_wake(struct brcmstb_gpio_priv *priv,
 		ret = disable_irq_wake(priv->parent_wake_irq);
 	if (ret)
 		dev_err(&priv->pdev->dev, "failed to %s wake-up interrupt\n",
-				enable ? "enable" : "disable");
+			str_enable_disable(enable));
 	return ret;
 }
 
@@ -436,7 +437,7 @@ static int brcmstb_gpio_irq_setup(struct platform_device *pdev,
 	int err;
 
 	priv->irq_domain =
-		irq_domain_add_linear(np, priv->num_gpios,
+		irq_domain_create_linear(of_fwnode_handle(np), priv->num_gpios,
 				      &brcmstb_gpio_irq_domain_ops,
 				      priv);
 	if (!priv->irq_domain) {
@@ -591,8 +592,6 @@ static int brcmstb_gpio_probe(struct platform_device *pdev)
 	void __iomem *reg_base;
 	struct brcmstb_gpio_priv *priv;
 	struct resource *res;
-	struct property *prop;
-	const __be32 *p;
 	u32 bank_width;
 	int num_banks = 0;
 	int num_gpios = 0;
@@ -636,8 +635,7 @@ static int brcmstb_gpio_probe(struct platform_device *pdev)
 	flags = BGPIOF_BIG_ENDIAN_BYTE_ORDER;
 #endif
 
-	of_property_for_each_u32(np, "brcm,gpio-bank-widths", prop, p,
-			bank_width) {
+	of_property_for_each_u32(np, "brcm,gpio-bank-widths", bank_width) {
 		struct brcmstb_gpio_bank *bank;
 		struct gpio_chip *gc;
 
@@ -754,7 +752,7 @@ static struct platform_driver brcmstb_gpio_driver = {
 		.pm = &brcmstb_gpio_pm_ops,
 	},
 	.probe = brcmstb_gpio_probe,
-	.remove_new = brcmstb_gpio_remove,
+	.remove = brcmstb_gpio_remove,
 	.shutdown = brcmstb_gpio_shutdown,
 };
 module_platform_driver(brcmstb_gpio_driver);

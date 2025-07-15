@@ -712,7 +712,6 @@ static const struct dc_plane_cap plane_cap = {
 static const struct dc_debug_options debug_defaults_drv = {
 	.disable_dmcu = true,
 	.force_abm_enable = false,
-	.timing_trace = false,
 	.clock_trace = true,
 	.disable_pplib_clock_request = false,
 	.pipe_split_policy = MPC_SPLIT_AVOID,
@@ -721,7 +720,7 @@ static const struct dc_debug_options debug_defaults_drv = {
 	.disable_dpp_power_gate = true,
 	.disable_hubp_power_gate = true,
 	.disable_optc_power_gate = true, /*should the same as above two*/
-	.disable_hpo_power_gate = false, /*dmubfw force domain25 on*/
+	.disable_hpo_power_gate = true, /*dmubfw force domain25 on*/
 	.disable_clock_gate = false,
 	.disable_dsc_power_gate = true,
 	.vsr_support = true,
@@ -758,7 +757,7 @@ static const struct dc_debug_options debug_defaults_drv = {
 			.symclk32_se = true,
 			.symclk32_le = true,
 			.symclk_fe = true,
-			.physymclk = true,
+			.physymclk = false,
 			.dpiasymclk = true,
 		}
 	},
@@ -785,6 +784,8 @@ static const struct dc_debug_options debug_defaults_drv = {
 	.ips2_entry_delay_us = 800,
 	.disable_dmub_reallow_idle = false,
 	.static_screen_wait_frames = 2,
+	.disable_timeout = true,
+	.min_disp_clk_khz = 50000,
 };
 
 static const struct dc_panel_config panel_config_defaults = {
@@ -1072,7 +1073,7 @@ static struct link_encoder *dcn35_link_encoder_create(
 	struct dcn20_link_encoder *enc20 =
 		kzalloc(sizeof(struct dcn20_link_encoder), GFP_KERNEL);
 
-	if (!enc20)
+	if (!enc20 || enc_init_data->hpd_source >= ARRAY_SIZE(link_enc_hpd_regs))
 		return NULL;
 
 #undef REG_STRUCT
@@ -1716,6 +1717,7 @@ static struct clock_source *dcn35_clock_source_create(
 		return &clk_src->base;
 	}
 
+	kfree(clk_src);
 	BREAK_TO_DEBUGGER();
 	return NULL;
 }
@@ -1730,7 +1732,7 @@ static void dcn35_get_panel_config_defaults(struct dc_panel_config *panel_config
 }
 
 
-static bool dcn35_validate_bandwidth(struct dc *dc,
+static enum dc_status dcn35_validate_bandwidth(struct dc *dc,
 		struct dc_state *context,
 		bool fast_validate)
 {
@@ -1741,13 +1743,20 @@ static bool dcn35_validate_bandwidth(struct dc *dc,
 			fast_validate);
 
 	if (fast_validate)
-		return out;
+		return out ? DC_OK : DC_FAIL_BANDWIDTH_VALIDATE;
 
 	DC_FP_START();
 	dcn35_decide_zstate_support(dc, context);
 	DC_FP_END();
 
-	return out;
+	return out ? DC_OK : DC_FAIL_BANDWIDTH_VALIDATE;
+}
+
+enum dc_status dcn35_patch_unknown_plane_state(struct dc_plane_state *plane_state)
+{
+	plane_state->tiling_info.gfxversion = DcGfxVersion9;
+	dcn20_patch_unknown_plane_state(plane_state);
+	return DC_OK;
 }
 
 
@@ -1773,9 +1782,11 @@ static struct resource_funcs dcn35_res_pool_funcs = {
 	.acquire_post_bldn_3dlut = dcn30_acquire_post_bldn_3dlut,
 	.release_post_bldn_3dlut = dcn30_release_post_bldn_3dlut,
 	.update_bw_bounding_box = dcn35_update_bw_bounding_box_fpu,
-	.patch_unknown_plane_state = dcn20_patch_unknown_plane_state,
+	.patch_unknown_plane_state = dcn35_patch_unknown_plane_state,
 	.get_panel_config_defaults = dcn35_get_panel_config_defaults,
 	.get_preferred_eng_id_dpia = dcn35_get_preferred_eng_id_dpia,
+	.get_det_buffer_size = dcn31_get_det_buffer_size,
+	.get_vstartup_for_pipe = dcn10_get_vstartup_for_pipe
 };
 
 static bool dcn35_resource_construct(
@@ -1828,9 +1839,9 @@ static bool dcn35_resource_construct(
 	dc->caps.max_cursor_size = 256;
 	dc->caps.min_horizontal_blanking_period = 80;
 	dc->caps.dmdata_alloc_size = 2048;
-	dc->caps.max_slave_planes = 2;
-	dc->caps.max_slave_yuv_planes = 2;
-	dc->caps.max_slave_rgb_planes = 2;
+	dc->caps.max_slave_planes = 3;
+	dc->caps.max_slave_yuv_planes = 3;
+	dc->caps.max_slave_rgb_planes = 3;
 	dc->caps.post_blend_color_processing = true;
 	dc->caps.force_dp_tps4_for_cp2520 = true;
 	if (dc->config.forceHBR2CP2520)
@@ -1847,6 +1858,7 @@ static bool dcn35_resource_construct(
 	dc->caps.zstate_support = true;
 	dc->caps.ips_support = true;
 	dc->caps.max_v_total = (1 << 15) - 1;
+	dc->caps.vtotal_limited_by_fp2 = true;
 
 	/* Color pipeline capabilities */
 	dc->caps.color.dpp.dcn_arch = 1;
@@ -1882,6 +1894,9 @@ static bool dcn35_resource_construct(
 	dc->caps.color.mpc.ogam_rom_caps.hlg = 0;
 	dc->caps.color.mpc.ocsc = 1;
 
+	dc->caps.num_of_host_routers = 2;
+	dc->caps.num_of_dpias_per_host_router = 2;
+
 	/* max_disp_clock_khz_at_vmin is slightly lower than the STA value in order
 	 * to provide some margin.
 	 * It's expected for furture ASIC to have equal or higher value, in order to
@@ -1890,9 +1905,15 @@ static bool dcn35_resource_construct(
 	 */
 	dc->caps.max_disp_clock_khz_at_vmin = 650000;
 
+	/* Sequential ONO is based on ASIC. */
+	if (dc->ctx->asic_id.hw_internal_rev >= 0x40)
+		dc->caps.sequential_ono = true;
+
 	/* Use pipe context based otg sync logic */
 	dc->config.use_pipe_ctx_sync_logic = true;
 
+
+	dc->config.disable_hbr_audio_dp2 = true;
 	/* read VBIOS LTTPR caps */
 	{
 		if (ctx->dc_bios->funcs->get_lttpr_caps) {
@@ -2146,8 +2167,8 @@ static bool dcn35_resource_construct(
 	dc->dml2_options.callbacks.can_support_mclk_switch_using_fw_based_vblank_stretch = &dcn30_can_support_mclk_switch_using_fw_based_vblank_stretch;
 
 	dc->dml2_options.max_segments_per_hubp = 24;
-
 	dc->dml2_options.det_segment_size = DCN3_2_DET_SEG_SIZE;/*todo*/
+	dc->dml2_options.override_det_buffer_size_kbytes = true;
 
 	if (dc->config.sdpif_request_limit_words_per_umc == 0)
 		dc->config.sdpif_request_limit_words_per_umc = 16;/*todo*/

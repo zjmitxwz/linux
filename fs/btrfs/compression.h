@@ -11,7 +11,9 @@
 #include <linux/list.h>
 #include <linux/workqueue.h>
 #include <linux/wait.h>
+#include <linux/pagemap.h>
 #include "bio.h"
+#include "messages.h"
 
 struct address_space;
 struct page;
@@ -72,23 +74,25 @@ struct compressed_bio {
 	struct btrfs_bio bbio;
 };
 
-static inline unsigned int btrfs_compress_type(unsigned int type_level)
+/* @range_end must be exclusive. */
+static inline u32 btrfs_calc_input_length(struct folio *folio, u64 range_end, u64 cur)
 {
-	return (type_level & 0xF);
-}
+	const u64 folio_end = folio_pos(folio) + folio_size(folio);
 
-static inline unsigned int btrfs_compress_level(unsigned int type_level)
-{
-	return ((type_level & 0xF0) >> 4);
+	/* @cur must be inside the folio. */
+	ASSERT(folio_pos(folio) <= cur);
+	ASSERT(cur < folio_end);
+	return min(range_end, folio_end) - cur;
 }
 
 int __init btrfs_init_compress(void);
 void __cold btrfs_exit_compress(void);
 
-int btrfs_compress_folios(unsigned int type_level, struct address_space *mapping,
+bool btrfs_compress_level_valid(unsigned int type, int level);
+int btrfs_compress_folios(unsigned int type, int level, struct address_space *mapping,
 			  u64 start, struct folio **folios, unsigned long *out_folios,
 			 unsigned long *total_in, unsigned long *total_out);
-int btrfs_decompress(int type, const u8 *data_in, struct page *dest_page,
+int btrfs_decompress(int type, const u8 *data_in, struct folio *dest_folio,
 		     unsigned long start_byte, size_t srclen, size_t destlen);
 int btrfs_decompress_buf2page(const char *buf, u32 buf_len,
 			      struct compressed_bio *cb, u32 decompressed);
@@ -99,7 +103,7 @@ void btrfs_submit_compressed_write(struct btrfs_ordered_extent *ordered,
 				   bool writeback);
 void btrfs_submit_compressed_read(struct btrfs_bio *bbio);
 
-unsigned int btrfs_compress_str2level(unsigned int type, const char *str);
+int btrfs_compress_str2level(unsigned int type, const char *str);
 
 struct folio *btrfs_alloc_compr_folio(void);
 void btrfs_free_compr_folio(struct folio *folio);
@@ -123,14 +127,15 @@ struct workspace_manager {
 	wait_queue_head_t ws_wait;
 };
 
-struct list_head *btrfs_get_workspace(int type, unsigned int level);
+struct list_head *btrfs_get_workspace(int type, int level);
 void btrfs_put_workspace(int type, struct list_head *ws);
 
 struct btrfs_compress_op {
 	struct workspace_manager *workspace_manager;
 	/* Maximum level supported by the compression algorithm */
-	unsigned int max_level;
-	unsigned int default_level;
+	int min_level;
+	int max_level;
+	int default_level;
 };
 
 /* The heuristic workspaces are managed via the 0th workspace manager */
@@ -144,7 +149,7 @@ extern const struct btrfs_compress_op btrfs_zstd_compress;
 const char* btrfs_compress_type2str(enum btrfs_compression_type type);
 bool btrfs_compress_is_valid_type(const char *str, size_t len);
 
-int btrfs_compress_heuristic(struct inode *inode, u64 start, u64 end);
+int btrfs_compress_heuristic(struct btrfs_inode *inode, u64 start, u64 end);
 
 int btrfs_compress_filemap_get_folio(struct address_space *mapping, u64 start,
 				     struct folio **in_folio_ret);
@@ -154,7 +159,7 @@ int zlib_compress_folios(struct list_head *ws, struct address_space *mapping,
 		unsigned long *total_in, unsigned long *total_out);
 int zlib_decompress_bio(struct list_head *ws, struct compressed_bio *cb);
 int zlib_decompress(struct list_head *ws, const u8 *data_in,
-		struct page *dest_page, unsigned long dest_pgoff, size_t srclen,
+		struct folio *dest_folio, unsigned long dest_pgoff, size_t srclen,
 		size_t destlen);
 struct list_head *zlib_alloc_workspace(unsigned int level);
 void zlib_free_workspace(struct list_head *ws);
@@ -165,9 +170,9 @@ int lzo_compress_folios(struct list_head *ws, struct address_space *mapping,
 		unsigned long *total_in, unsigned long *total_out);
 int lzo_decompress_bio(struct list_head *ws, struct compressed_bio *cb);
 int lzo_decompress(struct list_head *ws, const u8 *data_in,
-		struct page *dest_page, unsigned long dest_pgoff, size_t srclen,
+		struct folio *dest_folio, unsigned long dest_pgoff, size_t srclen,
 		size_t destlen);
-struct list_head *lzo_alloc_workspace(unsigned int level);
+struct list_head *lzo_alloc_workspace(void);
 void lzo_free_workspace(struct list_head *ws);
 
 int zstd_compress_folios(struct list_head *ws, struct address_space *mapping,
@@ -175,13 +180,13 @@ int zstd_compress_folios(struct list_head *ws, struct address_space *mapping,
 		unsigned long *total_in, unsigned long *total_out);
 int zstd_decompress_bio(struct list_head *ws, struct compressed_bio *cb);
 int zstd_decompress(struct list_head *ws, const u8 *data_in,
-		struct page *dest_page, unsigned long dest_pgoff, size_t srclen,
+		struct folio *dest_folio, unsigned long dest_pgoff, size_t srclen,
 		size_t destlen);
 void zstd_init_workspace_manager(void);
 void zstd_cleanup_workspace_manager(void);
-struct list_head *zstd_alloc_workspace(unsigned int level);
+struct list_head *zstd_alloc_workspace(int level);
 void zstd_free_workspace(struct list_head *ws);
-struct list_head *zstd_get_workspace(unsigned int level);
+struct list_head *zstd_get_workspace(int level);
 void zstd_put_workspace(struct list_head *ws);
 
 #endif

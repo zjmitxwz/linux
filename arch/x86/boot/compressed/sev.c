@@ -21,98 +21,13 @@
 #include <asm/fpu/xcr.h>
 #include <asm/ptrace.h>
 #include <asm/svm.h>
-#include <asm/cpuid.h>
+#include <asm/cpuid/api.h>
 
 #include "error.h"
-#include "../msr.h"
+#include "sev.h"
 
 static struct ghcb boot_ghcb_page __aligned(PAGE_SIZE);
 struct ghcb *boot_ghcb;
-
-/*
- * Copy a version of this function here - insn-eval.c can't be used in
- * pre-decompression code.
- */
-static bool insn_has_rep_prefix(struct insn *insn)
-{
-	insn_byte_t p;
-	int i;
-
-	insn_get_prefixes(insn);
-
-	for_each_insn_prefix(insn, i, p) {
-		if (p == 0xf2 || p == 0xf3)
-			return true;
-	}
-
-	return false;
-}
-
-/*
- * Only a dummy for insn_get_seg_base() - Early boot-code is 64bit only and
- * doesn't use segments.
- */
-static unsigned long insn_get_seg_base(struct pt_regs *regs, int seg_reg_idx)
-{
-	return 0UL;
-}
-
-static inline u64 sev_es_rd_ghcb_msr(void)
-{
-	struct msr m;
-
-	boot_rdmsr(MSR_AMD64_SEV_ES_GHCB, &m);
-
-	return m.q;
-}
-
-static inline void sev_es_wr_ghcb_msr(u64 val)
-{
-	struct msr m;
-
-	m.q = val;
-	boot_wrmsr(MSR_AMD64_SEV_ES_GHCB, &m);
-}
-
-static enum es_result vc_decode_insn(struct es_em_ctxt *ctxt)
-{
-	char buffer[MAX_INSN_SIZE];
-	int ret;
-
-	memcpy(buffer, (unsigned char *)ctxt->regs->ip, MAX_INSN_SIZE);
-
-	ret = insn_decode(&ctxt->insn, buffer, MAX_INSN_SIZE, INSN_MODE_64);
-	if (ret < 0)
-		return ES_DECODE_FAILED;
-
-	return ES_OK;
-}
-
-static enum es_result vc_write_mem(struct es_em_ctxt *ctxt,
-				   void *dst, char *buf, size_t size)
-{
-	memcpy(dst, buf, size);
-
-	return ES_OK;
-}
-
-static enum es_result vc_read_mem(struct es_em_ctxt *ctxt,
-				  void *src, char *buf, size_t size)
-{
-	memcpy(buf, src, size);
-
-	return ES_OK;
-}
-
-static enum es_result vc_ioio_check(struct es_em_ctxt *ctxt, u16 port, size_t size)
-{
-	return ES_OK;
-}
-
-static bool fault_in_kernel_space(unsigned long address)
-{
-	return false;
-}
 
 #undef __init
 #define __init
@@ -122,31 +37,62 @@ static bool fault_in_kernel_space(unsigned long address)
 
 #define __BOOT_COMPRESSED
 
-/* Basic instruction decoding support needed */
-#include "../../lib/inat.c"
-#include "../../lib/insn.c"
+extern struct svsm_ca *boot_svsm_caa;
+extern u64 boot_svsm_caa_pa;
+
+struct svsm_ca *svsm_get_caa(void)
+{
+	return boot_svsm_caa;
+}
+
+u64 svsm_get_caa_pa(void)
+{
+	return boot_svsm_caa_pa;
+}
+
+int svsm_perform_call_protocol(struct svsm_call *call);
+
+u8 snp_vmpl;
 
 /* Include code for early handlers */
-#include "../../kernel/sev-shared.c"
+#include "../../boot/startup/sev-shared.c"
 
-bool sev_snp_enabled(void)
+int svsm_perform_call_protocol(struct svsm_call *call)
+{
+	struct ghcb *ghcb;
+	int ret;
+
+	if (boot_ghcb)
+		ghcb = boot_ghcb;
+	else
+		ghcb = NULL;
+
+	do {
+		ret = ghcb ? svsm_perform_ghcb_protocol(ghcb, call)
+			   : svsm_perform_msr_protocol(call);
+	} while (ret == -EAGAIN);
+
+	return ret;
+}
+
+static bool sev_snp_enabled(void)
 {
 	return sev_status & MSR_AMD64_SEV_SNP_ENABLED;
 }
 
 static void __page_state_change(unsigned long paddr, enum psc_op op)
 {
-	u64 val;
-
-	if (!sev_snp_enabled())
-		return;
+	u64 val, msr;
 
 	/*
 	 * If private -> shared then invalidate the page before requesting the
 	 * state change in the RMP table.
 	 */
-	if (op == SNP_PAGE_STATE_SHARED && pvalidate(paddr, RMP_PG_SIZE_4K, 0))
-		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PVALIDATE);
+	if (op == SNP_PAGE_STATE_SHARED)
+		pvalidate_4k_page(paddr, paddr, false);
+
+	/* Save the current GHCB MSR value */
+	msr = sev_es_rd_ghcb_msr();
 
 	/* Issue VMGEXIT to change the page state in RMP table. */
 	sev_es_wr_ghcb_msr(GHCB_MSR_PSC_REQ_GFN(paddr >> PAGE_SHIFT, op));
@@ -157,25 +103,34 @@ static void __page_state_change(unsigned long paddr, enum psc_op op)
 	if ((GHCB_RESP_CODE(val) != GHCB_MSR_PSC_RESP) || GHCB_MSR_PSC_RESP_VAL(val))
 		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PSC);
 
+	/* Restore the GHCB MSR value */
+	sev_es_wr_ghcb_msr(msr);
+
 	/*
 	 * Now that page state is changed in the RMP table, validate it so that it is
 	 * consistent with the RMP entry.
 	 */
-	if (op == SNP_PAGE_STATE_PRIVATE && pvalidate(paddr, RMP_PG_SIZE_4K, 1))
-		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PVALIDATE);
+	if (op == SNP_PAGE_STATE_PRIVATE)
+		pvalidate_4k_page(paddr, paddr, true);
 }
 
 void snp_set_page_private(unsigned long paddr)
 {
+	if (!sev_snp_enabled())
+		return;
+
 	__page_state_change(paddr, SNP_PAGE_STATE_PRIVATE);
 }
 
 void snp_set_page_shared(unsigned long paddr)
 {
+	if (!sev_snp_enabled())
+		return;
+
 	__page_state_change(paddr, SNP_PAGE_STATE_SHARED);
 }
 
-static bool early_setup_ghcb(void)
+bool early_setup_ghcb(void)
 {
 	if (set_page_decrypted((unsigned long)&boot_ghcb_page))
 		return false;
@@ -186,7 +141,7 @@ static bool early_setup_ghcb(void)
 	boot_ghcb = &boot_ghcb_page;
 
 	/* Initialize lookup tables for the instruction decoder */
-	inat_init_tables();
+	sev_insn_decode_init();
 
 	/* SNP guest requires the GHCB GPA must be registered */
 	if (sev_snp_enabled())
@@ -195,56 +150,10 @@ static bool early_setup_ghcb(void)
 	return true;
 }
 
-static phys_addr_t __snp_accept_memory(struct snp_psc_desc *desc,
-				       phys_addr_t pa, phys_addr_t pa_end)
-{
-	struct psc_hdr *hdr;
-	struct psc_entry *e;
-	unsigned int i;
-
-	hdr = &desc->hdr;
-	memset(hdr, 0, sizeof(*hdr));
-
-	e = desc->entries;
-
-	i = 0;
-	while (pa < pa_end && i < VMGEXIT_PSC_MAX_ENTRY) {
-		hdr->end_entry = i;
-
-		e->gfn = pa >> PAGE_SHIFT;
-		e->operation = SNP_PAGE_STATE_PRIVATE;
-		if (IS_ALIGNED(pa, PMD_SIZE) && (pa_end - pa) >= PMD_SIZE) {
-			e->pagesize = RMP_PG_SIZE_2M;
-			pa += PMD_SIZE;
-		} else {
-			e->pagesize = RMP_PG_SIZE_4K;
-			pa += PAGE_SIZE;
-		}
-
-		e++;
-		i++;
-	}
-
-	if (vmgexit_psc(boot_ghcb, desc))
-		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PSC);
-
-	pvalidate_pages(desc);
-
-	return pa;
-}
-
 void snp_accept_memory(phys_addr_t start, phys_addr_t end)
 {
-	struct snp_psc_desc desc = {};
-	unsigned int i;
-	phys_addr_t pa;
-
-	if (!boot_ghcb && !early_setup_ghcb())
-		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PSC);
-
-	pa = start;
-	while (pa < end)
-		pa = __snp_accept_memory(&desc, pa, end);
+	for (phys_addr_t pa = start; pa < end; pa += PAGE_SIZE)
+		__page_state_change(pa, SNP_PAGE_STATE_PRIVATE);
 }
 
 void sev_es_shutdown_ghcb(void)
@@ -254,6 +163,16 @@ void sev_es_shutdown_ghcb(void)
 
 	if (!sev_es_check_cpu_features())
 		error("SEV-ES CPU Features missing.");
+
+	/*
+	 * This denotes whether to use the GHCB MSR protocol or the GHCB
+	 * shared page to perform a GHCB request. Since the GHCB page is
+	 * being changed to encrypted, it can't be used to perform GHCB
+	 * requests. Clear the boot_ghcb variable so that the GHCB MSR
+	 * protocol is used to change the GHCB page over to an encrypted
+	 * page.
+	 */
+	boot_ghcb = NULL;
 
 	/*
 	 * GHCB Page must be flushed from the cache and mapped encrypted again.
@@ -295,46 +214,6 @@ bool sev_es_check_ghcb_fault(unsigned long address)
 	return ((address & PAGE_MASK) == (unsigned long)&boot_ghcb_page);
 }
 
-void do_boot_stage2_vc(struct pt_regs *regs, unsigned long exit_code)
-{
-	struct es_em_ctxt ctxt;
-	enum es_result result;
-
-	if (!boot_ghcb && !early_setup_ghcb())
-		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_GEN_REQ);
-
-	vc_ghcb_invalidate(boot_ghcb);
-	result = vc_init_em_ctxt(&ctxt, regs, exit_code);
-	if (result != ES_OK)
-		goto finish;
-
-	result = vc_check_opcode_bytes(&ctxt, exit_code);
-	if (result != ES_OK)
-		goto finish;
-
-	switch (exit_code) {
-	case SVM_EXIT_RDTSC:
-	case SVM_EXIT_RDTSCP:
-		result = vc_handle_rdtsc(boot_ghcb, &ctxt, exit_code);
-		break;
-	case SVM_EXIT_IOIO:
-		result = vc_handle_ioio(boot_ghcb, &ctxt);
-		break;
-	case SVM_EXIT_CPUID:
-		result = vc_handle_cpuid(boot_ghcb, &ctxt);
-		break;
-	default:
-		result = ES_UNSUPPORTED;
-		break;
-	}
-
-finish:
-	if (result == ES_OK)
-		vc_finish_insn(&ctxt);
-	else if (result != ES_RETRY)
-		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_GEN_REQ);
-}
-
 /*
  * SNP_FEATURES_IMPL_REQ is the mask of SNP features that will need
  * guest side implementation for proper functioning of the guest. If any
@@ -363,7 +242,8 @@ finish:
  * by the guest kernel. As and when a new feature is implemented in the
  * guest kernel, a corresponding bit should be added to the mask.
  */
-#define SNP_FEATURES_PRESENT	MSR_AMD64_SNP_DEBUG_SWAP
+#define SNP_FEATURES_PRESENT	(MSR_AMD64_SNP_DEBUG_SWAP |	\
+				 MSR_AMD64_SNP_SECURE_TSC)
 
 u64 snp_get_unsupported_features(u64 status)
 {
@@ -461,6 +341,13 @@ static bool early_snp_init(struct boot_params *bp)
 	 * more details.
 	 */
 	setup_cpuid_table(cc_info);
+
+	/*
+	 * Record the SVSM Calling Area (CA) address if the guest is not
+	 * running at VMPL0. The CA will be used to communicate with the
+	 * SVSM and request its services.
+	 */
+	svsm_setup_ca(cc_info);
 
 	/*
 	 * Pass run-time kernel a pointer to CC info via boot_params so EFI
@@ -565,22 +452,31 @@ void sev_enable(struct boot_params *bp)
 	 * features.
 	 */
 	if (sev_status & MSR_AMD64_SEV_SNP_ENABLED) {
-		if (!(get_hv_features() & GHCB_HV_FT_SNP))
+		u64 hv_features;
+		int ret;
+
+		hv_features = get_hv_features();
+		if (!(hv_features & GHCB_HV_FT_SNP))
 			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
 
 		/*
-		 * Enforce running at VMPL0.
+		 * Enforce running at VMPL0 or with an SVSM.
 		 *
-		 * RMPADJUST modifies RMP permissions of a lesser-privileged (numerically
-		 * higher) privilege level. Here, clear the VMPL1 permission mask of the
-		 * GHCB page. If the guest is not running at VMPL0, this will fail.
-		 *
-		 * If the guest is running at VMPL0, it will succeed. Even if that operation
-		 * modifies permission bits, it is still ok to do so currently because Linux
-		 * SNP guests running at VMPL0 only run at VMPL0, so VMPL1 or higher
-		 * permission mask changes are a don't-care.
+		 * Use RMPADJUST (see the rmpadjust() function for a description of
+		 * what the instruction does) to update the VMPL1 permissions of a
+		 * page. If the guest is running at VMPL0, this will succeed. If the
+		 * guest is running at any other VMPL, this will fail. Linux SNP guests
+		 * only ever run at a single VMPL level so permission mask changes of a
+		 * lesser-privileged VMPL are a don't-care.
 		 */
-		if (rmpadjust((unsigned long)&boot_ghcb_page, RMP_PG_SIZE_4K, 1))
+		ret = rmpadjust((unsigned long)&boot_ghcb_page, RMP_PG_SIZE_4K, 1);
+
+		/*
+		 * Running at VMPL0 is not required if an SVSM is present and the hypervisor
+		 * supports the required SVSM GHCB events.
+		 */
+		if (ret &&
+		    !(snp_vmpl && (hv_features & GHCB_HV_FT_SNP_MULTI_VMPL)))
 			sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_NOT_VMPL0);
 	}
 
@@ -626,4 +522,44 @@ void sev_prep_identity_maps(unsigned long top_level_pgt)
 	}
 
 	sev_verify_cbit(top_level_pgt);
+}
+
+bool early_is_sevsnp_guest(void)
+{
+	static bool sevsnp;
+
+	if (sevsnp)
+		return true;
+
+	if (!(sev_get_status() & MSR_AMD64_SEV_SNP_ENABLED))
+		return false;
+
+	sevsnp = true;
+
+	if (!snp_vmpl) {
+		unsigned int eax, ebx, ecx, edx;
+
+		/*
+		 * CPUID Fn8000_001F_EAX[28] - SVSM support
+		 */
+		eax = 0x8000001f;
+		ecx = 0;
+		native_cpuid(&eax, &ebx, &ecx, &edx);
+		if (eax & BIT(28)) {
+			struct msr m;
+
+			/* Obtain the address of the calling area to use */
+			boot_rdmsr(MSR_SVSM_CAA, &m);
+			boot_svsm_caa = (void *)m.q;
+			boot_svsm_caa_pa = m.q;
+
+			/*
+			 * The real VMPL level cannot be discovered, but the
+			 * memory acceptance routines make no use of that so
+			 * any non-zero value suffices here.
+			 */
+			snp_vmpl = U8_MAX;
+		}
+	}
+	return true;
 }

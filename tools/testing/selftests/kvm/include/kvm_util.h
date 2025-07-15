@@ -46,6 +46,12 @@ struct userspace_mem_region {
 	struct hlist_node slot_node;
 };
 
+struct kvm_binary_stats {
+	int fd;
+	struct kvm_stats_header header;
+	struct kvm_stats_desc *desc;
+};
+
 struct kvm_vcpu {
 	struct list_head list;
 	uint32_t id;
@@ -55,6 +61,7 @@ struct kvm_vcpu {
 #ifdef __x86_64__
 	struct kvm_cpuid2 *cpuid;
 #endif
+	struct kvm_binary_stats stats;
 	struct kvm_dirty_gfn *dirty_gfns;
 	uint32_t fetch_index;
 	uint32_t dirty_gfns_count;
@@ -99,10 +106,7 @@ struct kvm_vm {
 
 	struct kvm_vm_arch arch;
 
-	/* Cache of information for binary stats interface */
-	int stats_fd;
-	struct kvm_stats_header stats_header;
-	struct kvm_stats_desc *stats_desc;
+	struct kvm_binary_stats stats;
 
 	/*
 	 * KVM region slots. These are the default memslots used by page
@@ -173,6 +177,7 @@ enum vm_guest_mode {
 	VM_MODE_P36V48_4K,
 	VM_MODE_P36V48_16K,
 	VM_MODE_P36V48_64K,
+	VM_MODE_P47V47_16K,
 	VM_MODE_P36V47_16K,
 	NUM_VM_MODES,
 };
@@ -225,6 +230,11 @@ extern enum vm_guest_mode vm_mode_default;
 #endif
 
 #define VM_MODE_DEFAULT			VM_MODE_P40V48_4K
+#define MIN_PAGE_SHIFT			12U
+#define ptes_per_page(page_size)	((page_size) / 8)
+
+#elif defined(__loongarch__)
+#define VM_MODE_DEFAULT			VM_MODE_P47V47_16K
 #define MIN_PAGE_SHIFT			12U
 #define ptes_per_page(page_size)	((page_size) / 8)
 
@@ -428,8 +438,6 @@ const char *vm_guest_mode_string(uint32_t i);
 void kvm_vm_free(struct kvm_vm *vmp);
 void kvm_vm_restart(struct kvm_vm *vmp);
 void kvm_vm_release(struct kvm_vm *vmp);
-int kvm_memcmp_hva_gva(void *hva, struct kvm_vm *vm, const vm_vaddr_t gva,
-		       size_t len);
 void kvm_vm_elf_load(struct kvm_vm *vm, const char *filename);
 int kvm_memfd_alloc(size_t size, bool hugepages);
 
@@ -458,6 +466,32 @@ static inline void kvm_vm_clear_dirty_log(struct kvm_vm *vm, int slot, void *log
 static inline uint32_t kvm_vm_reset_dirty_ring(struct kvm_vm *vm)
 {
 	return __vm_ioctl(vm, KVM_RESET_DIRTY_RINGS, NULL);
+}
+
+static inline void kvm_vm_register_coalesced_io(struct kvm_vm *vm,
+						uint64_t address,
+						uint64_t size, bool pio)
+{
+	struct kvm_coalesced_mmio_zone zone = {
+		.addr = address,
+		.size = size,
+		.pio  = pio,
+	};
+
+	vm_ioctl(vm, KVM_REGISTER_COALESCED_MMIO, &zone);
+}
+
+static inline void kvm_vm_unregister_coalesced_io(struct kvm_vm *vm,
+						  uint64_t address,
+						  uint64_t size, bool pio)
+{
+	struct kvm_coalesced_mmio_zone zone = {
+		.addr = address,
+		.size = size,
+		.pio  = pio,
+	};
+
+	vm_ioctl(vm, KVM_UNREGISTER_COALESCED_MMIO, &zone);
 }
 
 static inline int vm_get_stats_fd(struct kvm_vm *vm)
@@ -507,15 +541,53 @@ void read_stat_data(int stats_fd, struct kvm_stats_header *header,
 		    struct kvm_stats_desc *desc, uint64_t *data,
 		    size_t max_elements);
 
-void __vm_get_stat(struct kvm_vm *vm, const char *stat_name, uint64_t *data,
-		   size_t max_elements);
+void kvm_get_stat(struct kvm_binary_stats *stats, const char *name,
+		  uint64_t *data, size_t max_elements);
 
-static inline uint64_t vm_get_stat(struct kvm_vm *vm, const char *stat_name)
+#define __get_stat(stats, stat)							\
+({										\
+	uint64_t data;								\
+										\
+	kvm_get_stat(stats, #stat, &data, 1);					\
+	data;									\
+})
+
+#define vm_get_stat(vm, stat) __get_stat(&(vm)->stats, stat)
+#define vcpu_get_stat(vcpu, stat) __get_stat(&(vcpu)->stats, stat)
+
+static inline bool read_smt_control(char *buf, size_t buf_size)
 {
-	uint64_t data;
+	FILE *f = fopen("/sys/devices/system/cpu/smt/control", "r");
+	bool ret;
 
-	__vm_get_stat(vm, stat_name, &data, 1);
-	return data;
+	if (!f)
+		return false;
+
+	ret = fread(buf, sizeof(*buf), buf_size, f) > 0;
+	fclose(f);
+
+	return ret;
+}
+
+static inline bool is_smt_possible(void)
+{
+	char buf[16];
+
+	if (read_smt_control(buf, sizeof(buf)) &&
+	    (!strncmp(buf, "forceoff", 8) || !strncmp(buf, "notsupported", 12)))
+		return false;
+
+	return true;
+}
+
+static inline bool is_smt_on(void)
+{
+	char buf[16];
+
+	if (read_smt_control(buf, sizeof(buf)) && !strncmp(buf, "on", 2))
+		return true;
+
+	return false;
 }
 
 void vm_create_irqchip(struct kvm_vm *vm);
@@ -678,15 +750,21 @@ static inline int __vcpu_set_reg(struct kvm_vcpu *vcpu, uint64_t id, uint64_t va
 
 	return __vcpu_ioctl(vcpu, KVM_SET_ONE_REG, &reg);
 }
-static inline void vcpu_get_reg(struct kvm_vcpu *vcpu, uint64_t id, void *addr)
+static inline uint64_t vcpu_get_reg(struct kvm_vcpu *vcpu, uint64_t id)
 {
-	struct kvm_one_reg reg = { .id = id, .addr = (uint64_t)addr };
+	uint64_t val;
+	struct kvm_one_reg reg = { .id = id, .addr = (uint64_t)&val };
+
+	TEST_ASSERT(KVM_REG_SIZE(id) <= sizeof(val), "Reg %lx too big", id);
 
 	vcpu_ioctl(vcpu, KVM_GET_ONE_REG, &reg);
+	return val;
 }
 static inline void vcpu_set_reg(struct kvm_vcpu *vcpu, uint64_t id, uint64_t val)
 {
 	struct kvm_one_reg reg = { .id = id, .addr = (uint64_t)&val };
+
+	TEST_ASSERT(KVM_REG_SIZE(id) <= sizeof(val), "Reg %lx too big", id);
 
 	vcpu_ioctl(vcpu, KVM_SET_ONE_REG, &reg);
 }
@@ -932,6 +1010,8 @@ static inline struct kvm_vm *vm_create_shape_with_one_vcpu(struct vm_shape shape
 }
 
 struct kvm_vcpu *vm_recreate_with_one_vcpu(struct kvm_vm *vm);
+
+void kvm_set_files_rlimit(uint32_t nr_vcpus);
 
 void kvm_pin_this_task_to_pcpu(uint32_t pcpu);
 void kvm_print_vcpu_pinning_help(void);

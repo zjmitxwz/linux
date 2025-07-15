@@ -39,6 +39,8 @@
  *         (has carrier) or not
  * tx -  LED blinks on transmitted data
  * rx -  LED blinks on receive data
+ * tx_err -  LED blinks on transmit error
+ * rx_err -  LED blinks on receive error
  *
  * Note: If the user selects a mode that is not supported by hw, default
  * behavior is to fall back to software control of the LED. However not every
@@ -66,6 +68,7 @@ struct led_netdev_data {
 	unsigned int last_activity;
 
 	unsigned long mode;
+	unsigned long blink_delay;
 	int link_speed;
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(supported_link_modes);
 	u8 duplex;
@@ -84,6 +87,10 @@ static void set_baseline_state(struct led_netdev_data *trigger_data)
 	/* Already validated, hw control is possible with the requested mode */
 	if (trigger_data->hw_control) {
 		led_cdev->hw_control_set(led_cdev, trigger_data->mode);
+		if (led_cdev->blink_set) {
+			led_cdev->blink_set(led_cdev, &trigger_data->blink_delay,
+					    &trigger_data->blink_delay);
+		}
 
 		return;
 	}
@@ -144,7 +151,9 @@ static void set_baseline_state(struct led_netdev_data *trigger_data)
 		 * checking stats
 		 */
 		if (test_bit(TRIGGER_NETDEV_TX, &trigger_data->mode) ||
-		    test_bit(TRIGGER_NETDEV_RX, &trigger_data->mode))
+		    test_bit(TRIGGER_NETDEV_RX, &trigger_data->mode) ||
+		    test_bit(TRIGGER_NETDEV_TX_ERR, &trigger_data->mode) ||
+		    test_bit(TRIGGER_NETDEV_RX_ERR, &trigger_data->mode))
 			schedule_delayed_work(&trigger_data->work, 0);
 	}
 }
@@ -337,6 +346,8 @@ static ssize_t netdev_led_attr_show(struct device *dev, char *buf,
 	case TRIGGER_NETDEV_FULL_DUPLEX:
 	case TRIGGER_NETDEV_TX:
 	case TRIGGER_NETDEV_RX:
+	case TRIGGER_NETDEV_TX_ERR:
+	case TRIGGER_NETDEV_RX_ERR:
 		bit = attr;
 		break;
 	default:
@@ -371,6 +382,8 @@ static ssize_t netdev_led_attr_store(struct device *dev, const char *buf,
 	case TRIGGER_NETDEV_FULL_DUPLEX:
 	case TRIGGER_NETDEV_TX:
 	case TRIGGER_NETDEV_RX:
+	case TRIGGER_NETDEV_TX_ERR:
+	case TRIGGER_NETDEV_RX_ERR:
 		bit = attr;
 		break;
 	default:
@@ -429,6 +442,8 @@ DEFINE_NETDEV_TRIGGER(half_duplex, TRIGGER_NETDEV_HALF_DUPLEX);
 DEFINE_NETDEV_TRIGGER(full_duplex, TRIGGER_NETDEV_FULL_DUPLEX);
 DEFINE_NETDEV_TRIGGER(tx, TRIGGER_NETDEV_TX);
 DEFINE_NETDEV_TRIGGER(rx, TRIGGER_NETDEV_RX);
+DEFINE_NETDEV_TRIGGER(tx_err, TRIGGER_NETDEV_TX_ERR);
+DEFINE_NETDEV_TRIGGER(rx_err, TRIGGER_NETDEV_RX_ERR);
 
 static ssize_t interval_show(struct device *dev,
 			     struct device_attribute *attr, char *buf)
@@ -444,10 +459,11 @@ static ssize_t interval_store(struct device *dev,
 			      size_t size)
 {
 	struct led_netdev_data *trigger_data = led_trigger_get_drvdata(dev);
+	struct led_classdev *led_cdev = trigger_data->led_cdev;
 	unsigned long value;
 	int ret;
 
-	if (trigger_data->hw_control)
+	if (trigger_data->hw_control && !led_cdev->blink_set)
 		return -EINVAL;
 
 	ret = kstrtoul(buf, 0, &value);
@@ -456,9 +472,13 @@ static ssize_t interval_store(struct device *dev,
 
 	/* impose some basic bounds on the timer interval */
 	if (value >= 5 && value <= 10000) {
-		cancel_delayed_work_sync(&trigger_data->work);
+		if (trigger_data->hw_control) {
+			trigger_data->blink_delay = value;
+		} else {
+			cancel_delayed_work_sync(&trigger_data->work);
 
-		atomic_set(&trigger_data->interval, msecs_to_jiffies(value));
+			atomic_set(&trigger_data->interval, msecs_to_jiffies(value));
+		}
 		set_baseline_state(trigger_data);	/* resets timer */
 	}
 
@@ -538,6 +558,8 @@ static struct attribute *netdev_trig_attrs[] = {
 	&dev_attr_half_duplex.attr,
 	&dev_attr_rx.attr,
 	&dev_attr_tx.attr,
+	&dev_attr_rx_err.attr,
+	&dev_attr_tx_err.attr,
 	&dev_attr_interval.attr,
 	&dev_attr_offloaded.attr,
 	NULL
@@ -593,6 +615,8 @@ static int netdev_trig_notify(struct notifier_block *nb,
 		trigger_data->net_dev = NULL;
 		break;
 	case NETDEV_UP:
+		trigger_data->hw_control = can_hw_control(trigger_data);
+		fallthrough;
 	case NETDEV_CHANGE:
 		get_device_state(trigger_data);
 		/* Refresh link_speed visibility */
@@ -628,7 +652,9 @@ static void netdev_trig_work(struct work_struct *work)
 
 	/* If we are not looking for RX/TX then return  */
 	if (!test_bit(TRIGGER_NETDEV_TX, &trigger_data->mode) &&
-	    !test_bit(TRIGGER_NETDEV_RX, &trigger_data->mode))
+	    !test_bit(TRIGGER_NETDEV_RX, &trigger_data->mode) &&
+	    !test_bit(TRIGGER_NETDEV_TX_ERR, &trigger_data->mode) &&
+	    !test_bit(TRIGGER_NETDEV_RX_ERR, &trigger_data->mode))
 		return;
 
 	dev_stats = dev_get_stats(trigger_data->net_dev, &temp);
@@ -636,7 +662,11 @@ static void netdev_trig_work(struct work_struct *work)
 	    (test_bit(TRIGGER_NETDEV_TX, &trigger_data->mode) ?
 		dev_stats->tx_packets : 0) +
 	    (test_bit(TRIGGER_NETDEV_RX, &trigger_data->mode) ?
-		dev_stats->rx_packets : 0);
+		dev_stats->rx_packets : 0) +
+	    (test_bit(TRIGGER_NETDEV_TX_ERR, &trigger_data->mode) ?
+		dev_stats->tx_errors : 0) +
+	    (test_bit(TRIGGER_NETDEV_RX_ERR, &trigger_data->mode) ?
+		dev_stats->rx_errors : 0);
 
 	if (trigger_data->last_activity != new_activity) {
 		led_stop_software_blink(trigger_data->led_cdev);

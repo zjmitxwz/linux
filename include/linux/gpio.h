@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * <linux/gpio.h>
+ * NOTE: This header *must not* be included.
  *
  * This is the LEGACY GPIO bulk include file, including legacy APIs. It is
  * used for GPIO drivers still referencing the global GPIO numberspace,
@@ -16,21 +16,10 @@
 
 struct device;
 
-/* see Documentation/driver-api/gpio/legacy.rst */
-
 /* make these flag values available regardless of GPIO kconfig options */
-#define GPIOF_DIR_OUT	(0 << 0)
-#define GPIOF_DIR_IN	(1 << 0)
-
-#define GPIOF_INIT_LOW	(0 << 1)
-#define GPIOF_INIT_HIGH	(1 << 1)
-
-#define GPIOF_IN		(GPIOF_DIR_IN)
-#define GPIOF_OUT_INIT_LOW	(GPIOF_DIR_OUT | GPIOF_INIT_LOW)
-#define GPIOF_OUT_INIT_HIGH	(GPIOF_DIR_OUT | GPIOF_INIT_HIGH)
-
-/* Gpio pin is active-low */
-#define GPIOF_ACTIVE_LOW        (1 << 2)
+#define GPIOF_IN		((1 << 0))
+#define GPIOF_OUT_INIT_LOW	((0 << 0) | (0 << 1))
+#define GPIOF_OUT_INIT_HIGH	((0 << 0) | (1 << 1))
 
 /**
  * struct gpio - a structure describing a GPIO with configuration
@@ -102,7 +91,7 @@ static inline int gpio_get_value_cansleep(unsigned gpio)
 }
 static inline void gpio_set_value_cansleep(unsigned gpio, int value)
 {
-	return gpiod_set_raw_value_cansleep(gpio_to_desc(gpio), value);
+	gpiod_set_raw_value_cansleep(gpio_to_desc(gpio), value);
 }
 
 static inline int gpio_get_value(unsigned gpio)
@@ -111,7 +100,7 @@ static inline int gpio_get_value(unsigned gpio)
 }
 static inline void gpio_set_value(unsigned gpio, int value)
 {
-	return gpiod_set_raw_value(gpio_to_desc(gpio), value);
+	gpiod_set_raw_value(gpio_to_desc(gpio), value);
 }
 
 static inline int gpio_to_irq(unsigned gpio)
@@ -120,8 +109,6 @@ static inline int gpio_to_irq(unsigned gpio)
 }
 
 int gpio_request_one(unsigned gpio, unsigned long flags, const char *label);
-
-/* CONFIG_GPIOLIB: bindings for managed devices that want to request gpios */
 
 int devm_gpio_request(struct device *dev, unsigned gpio, const char *label);
 int devm_gpio_request_one(struct device *dev, unsigned gpio,

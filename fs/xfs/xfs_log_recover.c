@@ -1177,8 +1177,8 @@ xlog_check_unmount_rec(
 			 */
 			xlog_assign_atomic_lsn(&log->l_tail_lsn,
 					log->l_curr_cycle, after_umount_blk);
-			xlog_assign_atomic_lsn(&log->l_last_sync_lsn,
-					log->l_curr_cycle, after_umount_blk);
+			log->l_ailp->ail_head_lsn =
+					atomic64_read(&log->l_tail_lsn);
 			*tail_blk = after_umount_blk;
 
 			*clean = true;
@@ -1212,11 +1212,7 @@ xlog_set_state(
 	if (bump_cycle)
 		log->l_curr_cycle++;
 	atomic64_set(&log->l_tail_lsn, be64_to_cpu(rhead->h_tail_lsn));
-	atomic64_set(&log->l_last_sync_lsn, be64_to_cpu(rhead->h_lsn));
-	xlog_assign_grant_head(&log->l_reserve_head.grant, log->l_curr_cycle,
-					BBTOB(log->l_curr_block));
-	xlog_assign_grant_head(&log->l_write_head.grant, log->l_curr_cycle,
-					BBTOB(log->l_curr_block));
+	log->l_ailp->ail_head_lsn = be64_to_cpu(rhead->h_lsn);
 }
 
 /*
@@ -1340,7 +1336,7 @@ xlog_find_tail(
 	 * headers if we have a filesystem using non-persistent counters.
 	 */
 	if (clean)
-		set_bit(XFS_OPSTATE_CLEAN, &log->l_mp->m_opstate);
+		xfs_set_clean(log->l_mp);
 
 	/*
 	 * Make sure that there are no blocks in front of the head
@@ -1822,6 +1818,12 @@ static const struct xlog_recover_item_ops *xlog_recover_item_ops[] = {
 	&xlog_attrd_item_ops,
 	&xlog_xmi_item_ops,
 	&xlog_xmd_item_ops,
+	&xlog_rtefi_item_ops,
+	&xlog_rtefd_item_ops,
+	&xlog_rtrui_item_ops,
+	&xlog_rtrud_item_ops,
+	&xlog_rtcui_item_ops,
+	&xlog_rtcud_item_ops,
 };
 
 static const struct xlog_recover_item_ops *
@@ -1853,7 +1855,7 @@ xlog_find_item_ops(
  *	   from the transaction. However, we can't do that until after we've
  *	   replayed all the other items because they may be dependent on the
  *	   cancelled buffer and replaying the cancelled buffer can remove it
- *	   form the cancelled buffer table. Hence they have tobe done last.
+ *	   form the cancelled buffer table. Hence they have to be done last.
  *
  *	3. Inode allocation buffers must be replayed before inode items that
  *	   read the buffer and replay changes into it. For filesystems using the
@@ -2132,7 +2134,7 @@ xlog_recover_add_to_cont_trans(
 	old_ptr = item->ri_buf[item->ri_cnt-1].i_addr;
 	old_len = item->ri_buf[item->ri_cnt-1].i_len;
 
-	ptr = kvrealloc(old_ptr, old_len, len + old_len, GFP_KERNEL);
+	ptr = kvrealloc(old_ptr, len + old_len, GFP_KERNEL);
 	if (!ptr)
 		return -ENOMEM;
 	memcpy(&ptr[old_len], dp, len);
@@ -2489,7 +2491,10 @@ xlog_recover_process_data(
 
 		ohead = (struct xlog_op_header *)dp;
 		dp += sizeof(*ohead);
-		ASSERT(dp <= end);
+		if (dp > end) {
+			xfs_warn(log->l_mp, "%s: op header overrun", __func__);
+			return -EFSCORRUPTED;
+		}
 
 		/* errors will abort recovery */
 		error = xlog_recover_process_ophdr(log, rhash, rhead, ohead,
@@ -2678,7 +2683,7 @@ xlog_recover_clear_agi_bucket(
 	struct xfs_perag	*pag,
 	int			bucket)
 {
-	struct xfs_mount	*mp = pag->pag_mount;
+	struct xfs_mount	*mp = pag_mount(pag);
 	struct xfs_trans	*tp;
 	struct xfs_agi		*agi;
 	struct xfs_buf		*agibp;
@@ -2709,7 +2714,7 @@ out_abort:
 	xfs_trans_cancel(tp);
 out_error:
 	xfs_warn(mp, "%s: failed to clear agi %d. Continuing.", __func__,
-			pag->pag_agno);
+			pag_agno(pag));
 	return;
 }
 
@@ -2719,7 +2724,7 @@ xlog_recover_iunlink_bucket(
 	struct xfs_agi		*agi,
 	int			bucket)
 {
-	struct xfs_mount	*mp = pag->pag_mount;
+	struct xfs_mount	*mp = pag_mount(pag);
 	struct xfs_inode	*prev_ip = NULL;
 	struct xfs_inode	*ip;
 	xfs_agino_t		prev_agino, agino;
@@ -2727,9 +2732,8 @@ xlog_recover_iunlink_bucket(
 
 	agino = be32_to_cpu(agi->agi_unlinked[bucket]);
 	while (agino != NULLAGINO) {
-		error = xfs_iget(mp, NULL,
-				XFS_AGINO_TO_INO(mp, pag->pag_agno, agino),
-				0, 0, &ip);
+		error = xfs_iget(mp, NULL, xfs_agino_to_ino(pag, agino), 0, 0,
+				&ip);
 		if (error)
 			break;
 
@@ -2847,10 +2851,9 @@ static void
 xlog_recover_process_iunlinks(
 	struct xlog	*log)
 {
-	struct xfs_perag	*pag;
-	xfs_agnumber_t		agno;
+	struct xfs_perag	*pag = NULL;
 
-	for_each_perag(log->l_mp, agno, pag)
+	while ((pag = xfs_perag_next(log->l_mp, pag)))
 		xlog_recover_iunlink_ag(pag);
 }
 
@@ -3363,14 +3366,13 @@ xlog_do_recover(
 
 	/*
 	 * We now update the tail_lsn since much of the recovery has completed
-	 * and there may be space available to use.  If there were no extent
-	 * or iunlinks, we can free up the entire log and set the tail_lsn to
-	 * be the last_sync_lsn.  This was set in xlog_find_tail to be the
-	 * lsn of the last known good LR on disk.  If there are extent frees
-	 * or iunlinks they will have some entries in the AIL; so we look at
-	 * the AIL to determine how to set the tail_lsn.
+	 * and there may be space available to use.  If there were no extent or
+	 * iunlinks, we can free up the entire log.  This was set in
+	 * xlog_find_tail to be the lsn of the last known good LR on disk.  If
+	 * there are extent frees or iunlinks they will have some entries in the
+	 * AIL; so we look at the AIL to determine how to set the tail_lsn.
 	 */
-	xlog_assign_tail_lsn(mp);
+	xfs_ail_assign_tail_lsn(log->l_ailp);
 
 	/*
 	 * Now that we've finished replaying all buffer and inode updates,
@@ -3378,7 +3380,7 @@ xlog_do_recover(
 	 */
 	xfs_buf_lock(bp);
 	xfs_buf_hold(bp);
-	error = _xfs_buf_read(bp, XBF_READ);
+	error = _xfs_buf_read(bp);
 	if (error) {
 		if (!xlog_is_shutdown(log)) {
 			xfs_buf_ioerror_alert(bp, __this_address);
@@ -3395,13 +3397,6 @@ xlog_do_recover(
 	/* re-initialise in-core superblock and geometry structures */
 	mp->m_features |= xfs_sb_version_to_features(sbp);
 	xfs_reinit_percpu_counters(mp);
-	error = xfs_initialize_perag(mp, sbp->sb_agcount, sbp->sb_dblocks,
-			&mp->m_maxagi);
-	if (error) {
-		xfs_warn(mp, "Failed post-recovery per-ag init: %d", error);
-		return error;
-	}
-	mp->m_alloc_set_aside = xfs_alloc_set_aside(mp);
 
 	/* Normal transactions can now occur */
 	clear_bit(XLOG_ACTIVE_RECOVERY, &log->l_opstate);

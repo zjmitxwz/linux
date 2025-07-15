@@ -665,6 +665,7 @@ static const struct hda_vendor_id hda_vendor_ids[] = {
 	{ 0x19e5, "Huawei" },
 	{ 0x1aec, "Wolfson Microelectronics" },
 	{ 0x1af4, "QEMU" },
+	{ 0x1fa8, "Senarytech" },
 	{ 0x434d, "C-Media" },
 	{ 0x8086, "Intel" },
 	{ 0x8384, "SigmaTel" },
@@ -800,7 +801,7 @@ unsigned int snd_hdac_stream_format(unsigned int channels, unsigned int bits, un
 	if (!rate_bits[i].hz)
 		return 0;
 
-	if (channels == 0 || channels > 8)
+	if (channels == 0 || channels > 16)
 		return 0;
 	val |= channels - 1;
 

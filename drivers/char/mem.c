@@ -61,26 +61,8 @@ static inline int page_is_allowed(unsigned long pfn)
 {
 	return devmem_is_allowed(pfn);
 }
-static inline int range_is_allowed(unsigned long pfn, unsigned long size)
-{
-	u64 from = ((u64)pfn) << PAGE_SHIFT;
-	u64 to = from + size;
-	u64 cursor = from;
-
-	while (cursor < to) {
-		if (!devmem_is_allowed(pfn))
-			return 0;
-		cursor += PAGE_SIZE;
-		pfn++;
-	}
-	return 1;
-}
 #else
 static inline int page_is_allowed(unsigned long pfn)
-{
-	return 1;
-}
-static inline int range_is_allowed(unsigned long pfn, unsigned long size)
 {
 	return 1;
 }
@@ -643,6 +625,7 @@ static const struct file_operations __maybe_unused mem_fops = {
 	.get_unmapped_area = get_unmapped_area_mem,
 	.mmap_capabilities = memory_mmap_capabilities,
 #endif
+	.fop_flags	= FOP_UNSIGNED_OFFSET,
 };
 
 static const struct file_operations null_fops = {
@@ -693,7 +676,7 @@ static const struct memdev {
 	umode_t mode;
 } devlist[] = {
 #ifdef CONFIG_DEVMEM
-	[DEVMEM_MINOR] = { "mem", &mem_fops, FMODE_UNSIGNED_OFFSET, 0 },
+	[DEVMEM_MINOR] = { "mem", &mem_fops, 0, 0 },
 #endif
 	[3] = { "null", &null_fops, FMODE_NOWAIT, 0666 },
 #ifdef CONFIG_DEVPORT

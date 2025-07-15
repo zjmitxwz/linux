@@ -27,6 +27,7 @@
 #include <linux/pm_domain.h>
 #include <linux/reset-controller.h>
 #include <linux/slab.h>
+#include <linux/string_choices.h>
 #include <linux/units.h>
 
 #include <dt-bindings/clock/renesas-cpg-mssr.h>
@@ -51,6 +52,7 @@
 #define RZG3S_DIV_M		GENMASK(25, 22)
 #define RZG3S_DIV_NI		GENMASK(21, 13)
 #define RZG3S_DIV_NF		GENMASK(12, 1)
+#define RZG3S_SEL_PLL		BIT(0)
 
 #define CLK_ON_R(reg)		(reg)
 #define CLK_MON_R(reg)		(0x180 + (reg))
@@ -60,6 +62,7 @@
 #define GET_REG_OFFSET(val)		((val >> 20) & 0xfff)
 #define GET_REG_SAMPLL_CLK1(val)	((val >> 22) & 0xfff)
 #define GET_REG_SAMPLL_CLK2(val)	((val >> 12) & 0xfff)
+#define GET_REG_SAMPLL_SETTING(val)	((val) & 0xfff)
 
 #define CPG_WEN_BIT		BIT(16)
 
@@ -339,8 +342,7 @@ static const struct clk_ops rzg3s_div_clk_ops = {
 };
 
 static struct clk * __init
-rzg3s_cpg_div_clk_register(const struct cpg_core_clk *core, struct clk **clks,
-			   void __iomem *base, struct rzg2l_cpg_priv *priv)
+rzg3s_cpg_div_clk_register(const struct cpg_core_clk *core, struct rzg2l_cpg_priv *priv)
 {
 	struct div_hw_data *div_hw_data;
 	struct clk_init_data init = {};
@@ -351,7 +353,7 @@ rzg3s_cpg_div_clk_register(const struct cpg_core_clk *core, struct clk **clks,
 	u32 max = 0;
 	int ret;
 
-	parent = clks[core->parent & 0xffff];
+	parent = priv->clks[core->parent];
 	if (IS_ERR(parent))
 		return ERR_CAST(parent);
 
@@ -400,16 +402,15 @@ rzg3s_cpg_div_clk_register(const struct cpg_core_clk *core, struct clk **clks,
 
 static struct clk * __init
 rzg2l_cpg_div_clk_register(const struct cpg_core_clk *core,
-			   struct clk **clks,
-			   void __iomem *base,
 			   struct rzg2l_cpg_priv *priv)
 {
+	void __iomem *base = priv->base;
 	struct device *dev = priv->dev;
 	const struct clk *parent;
 	const char *parent_name;
 	struct clk_hw *clk_hw;
 
-	parent = clks[core->parent & 0xffff];
+	parent = priv->clks[core->parent];
 	if (IS_ERR(parent))
 		return ERR_CAST(parent);
 
@@ -440,7 +441,6 @@ rzg2l_cpg_div_clk_register(const struct cpg_core_clk *core,
 
 static struct clk * __init
 rzg2l_cpg_mux_clk_register(const struct cpg_core_clk *core,
-			   void __iomem *base,
 			   struct rzg2l_cpg_priv *priv)
 {
 	const struct clk_hw *clk_hw;
@@ -448,7 +448,7 @@ rzg2l_cpg_mux_clk_register(const struct cpg_core_clk *core,
 	clk_hw = devm_clk_hw_register_mux(priv->dev, core->name,
 					  core->parent_names, core->num_parents,
 					  core->flag,
-					  base + GET_REG_OFFSET(core->conf),
+					  priv->base + GET_REG_OFFSET(core->conf),
 					  GET_SHIFT(core->conf),
 					  GET_WIDTH(core->conf),
 					  core->mux_flags, &priv->rmw_lock);
@@ -508,7 +508,6 @@ static const struct clk_ops rzg2l_cpg_sd_clk_mux_ops = {
 
 static struct clk * __init
 rzg2l_cpg_sd_mux_clk_register(const struct cpg_core_clk *core,
-			      void __iomem *base,
 			      struct rzg2l_cpg_priv *priv)
 {
 	struct sd_mux_hw_data *sd_mux_hw_data;
@@ -552,7 +551,7 @@ static unsigned long
 rzg2l_cpg_get_foutpostdiv_rate(struct rzg2l_pll5_param *params,
 			       unsigned long rate)
 {
-	unsigned long foutpostdiv_rate;
+	unsigned long foutpostdiv_rate, foutvco_rate;
 
 	params->pl5_intin = rate / MEGA;
 	params->pl5_fracin = div_u64(((u64)rate % MEGA) << 24, MEGA);
@@ -561,10 +560,11 @@ rzg2l_cpg_get_foutpostdiv_rate(struct rzg2l_pll5_param *params,
 	params->pl5_postdiv2 = 1;
 	params->pl5_spread = 0x16;
 
-	foutpostdiv_rate =
-		EXTAL_FREQ_IN_MEGA_HZ * MEGA / params->pl5_refdiv *
-		((((params->pl5_intin << 24) + params->pl5_fracin)) >> 24) /
-		(params->pl5_postdiv1 * params->pl5_postdiv2);
+	foutvco_rate = div_u64(mul_u32_u32(EXTAL_FREQ_IN_MEGA_HZ * MEGA,
+					   (params->pl5_intin << 24) + params->pl5_fracin),
+			       params->pl5_refdiv) >> 24;
+	foutpostdiv_rate = DIV_ROUND_CLOSEST_ULL(foutvco_rate,
+						 params->pl5_postdiv1 * params->pl5_postdiv2);
 
 	return foutpostdiv_rate;
 }
@@ -652,7 +652,6 @@ static const struct clk_ops rzg2l_cpg_dsi_div_ops = {
 
 static struct clk * __init
 rzg2l_cpg_dsi_div_clk_register(const struct cpg_core_clk *core,
-			       struct clk **clks,
 			       struct rzg2l_cpg_priv *priv)
 {
 	struct dsi_div_hw_data *clk_hw_data;
@@ -662,7 +661,7 @@ rzg2l_cpg_dsi_div_clk_register(const struct cpg_core_clk *core,
 	struct clk_hw *clk_hw;
 	int ret;
 
-	parent = clks[core->parent & 0xffff];
+	parent = priv->clks[core->parent];
 	if (IS_ERR(parent))
 		return ERR_CAST(parent);
 
@@ -900,7 +899,6 @@ static const struct clk_ops rzg2l_cpg_sipll5_ops = {
 
 static struct clk * __init
 rzg2l_cpg_sipll5_register(const struct cpg_core_clk *core,
-			  struct clk **clks,
 			  struct rzg2l_cpg_priv *priv)
 {
 	const struct clk *parent;
@@ -910,7 +908,7 @@ rzg2l_cpg_sipll5_register(const struct cpg_core_clk *core,
 	struct clk_hw *clk_hw;
 	int ret;
 
-	parent = clks[core->parent & 0xffff];
+	parent = priv->clks[core->parent];
 	if (IS_ERR(parent))
 		return ERR_CAST(parent);
 
@@ -948,6 +946,7 @@ rzg2l_cpg_sipll5_register(const struct cpg_core_clk *core,
 
 struct pll_clk {
 	struct clk_hw hw;
+	unsigned long default_rate;
 	unsigned int conf;
 	unsigned int type;
 	void __iomem *base;
@@ -985,11 +984,18 @@ static unsigned long rzg3s_cpg_pll_clk_recalc_rate(struct clk_hw *hw,
 {
 	struct pll_clk *pll_clk = to_pll(hw);
 	struct rzg2l_cpg_priv *priv = pll_clk->priv;
-	u32 nir, nfr, mr, pr, val;
+	u32 nir, nfr, mr, pr, val, setting;
 	u64 rate;
 
 	if (pll_clk->type != CLK_TYPE_G3S_PLL)
 		return parent_rate;
+
+	setting = GET_REG_SAMPLL_SETTING(pll_clk->conf);
+	if (setting) {
+		val = readl(priv->base + setting);
+		if (val & RZG3S_SEL_PLL)
+			return pll_clk->default_rate;
+	}
 
 	val = readl(priv->base + GET_REG_SAMPLL_CLK1(pll_clk->conf));
 
@@ -1013,8 +1019,6 @@ static const struct clk_ops rzg3s_cpg_pll_ops = {
 
 static struct clk * __init
 rzg2l_cpg_pll_clk_register(const struct cpg_core_clk *core,
-			   struct clk **clks,
-			   void __iomem *base,
 			   struct rzg2l_cpg_priv *priv,
 			   const struct clk_ops *ops)
 {
@@ -1023,8 +1027,9 @@ rzg2l_cpg_pll_clk_register(const struct cpg_core_clk *core,
 	struct clk_init_data init;
 	const char *parent_name;
 	struct pll_clk *pll_clk;
+	int ret;
 
-	parent = clks[core->parent & 0xffff];
+	parent = priv->clks[core->parent];
 	if (IS_ERR(parent))
 		return ERR_CAST(parent);
 
@@ -1041,11 +1046,16 @@ rzg2l_cpg_pll_clk_register(const struct cpg_core_clk *core,
 
 	pll_clk->hw.init = &init;
 	pll_clk->conf = core->conf;
-	pll_clk->base = base;
+	pll_clk->base = priv->base;
 	pll_clk->priv = priv;
 	pll_clk->type = core->type;
+	pll_clk->default_rate = core->default_rate;
 
-	return clk_register(NULL, &pll_clk->hw);
+	ret = devm_clk_hw_register(dev, &pll_clk->hw);
+	if (ret)
+		return ERR_PTR(ret);
+
+	return pll_clk->hw.clk;
 }
 
 static struct clk
@@ -1102,14 +1112,10 @@ rzg2l_cpg_register_core_clk(const struct cpg_core_clk *core,
 	struct device *dev = priv->dev;
 	unsigned int id = core->id, div = core->div;
 	const char *parent_name;
+	struct clk_hw *clk_hw;
 
 	WARN_DEBUG(id >= priv->num_core_clks);
 	WARN_DEBUG(PTR_ERR(priv->clks[id]) != -ENOENT);
-
-	if (!core->name) {
-		/* Skip NULLified clock */
-		return;
-	}
 
 	switch (core->type) {
 	case CLK_TYPE_IN:
@@ -1124,39 +1130,40 @@ rzg2l_cpg_register_core_clk(const struct cpg_core_clk *core,
 		}
 
 		parent_name = __clk_get_name(parent);
-		clk = clk_register_fixed_factor(NULL, core->name,
-						parent_name, CLK_SET_RATE_PARENT,
-						core->mult, div);
+		clk_hw = devm_clk_hw_register_fixed_factor(dev, core->name, parent_name,
+							   CLK_SET_RATE_PARENT,
+							   core->mult, div);
+		if (IS_ERR(clk_hw))
+			clk = ERR_CAST(clk_hw);
+		else
+			clk = clk_hw->clk;
 		break;
 	case CLK_TYPE_SAM_PLL:
-		clk = rzg2l_cpg_pll_clk_register(core, priv->clks, priv->base, priv,
-						 &rzg2l_cpg_pll_ops);
+		clk = rzg2l_cpg_pll_clk_register(core, priv, &rzg2l_cpg_pll_ops);
 		break;
 	case CLK_TYPE_G3S_PLL:
-		clk = rzg2l_cpg_pll_clk_register(core, priv->clks, priv->base, priv,
-						 &rzg3s_cpg_pll_ops);
+		clk = rzg2l_cpg_pll_clk_register(core, priv, &rzg3s_cpg_pll_ops);
 		break;
 	case CLK_TYPE_SIPLL5:
-		clk = rzg2l_cpg_sipll5_register(core, priv->clks, priv);
+		clk = rzg2l_cpg_sipll5_register(core, priv);
 		break;
 	case CLK_TYPE_DIV:
-		clk = rzg2l_cpg_div_clk_register(core, priv->clks,
-						 priv->base, priv);
+		clk = rzg2l_cpg_div_clk_register(core, priv);
 		break;
 	case CLK_TYPE_G3S_DIV:
-		clk = rzg3s_cpg_div_clk_register(core, priv->clks, priv->base, priv);
+		clk = rzg3s_cpg_div_clk_register(core, priv);
 		break;
 	case CLK_TYPE_MUX:
-		clk = rzg2l_cpg_mux_clk_register(core, priv->base, priv);
+		clk = rzg2l_cpg_mux_clk_register(core, priv);
 		break;
 	case CLK_TYPE_SD_MUX:
-		clk = rzg2l_cpg_sd_mux_clk_register(core, priv->base, priv);
+		clk = rzg2l_cpg_sd_mux_clk_register(core, priv);
 		break;
 	case CLK_TYPE_PLL5_4_MUX:
 		clk = rzg2l_cpg_pll5_4_mux_clk_register(core, priv);
 		break;
 	case CLK_TYPE_DSI_DIV:
-		clk = rzg2l_cpg_dsi_div_clk_register(core, priv->clks, priv);
+		clk = rzg2l_cpg_dsi_div_clk_register(core, priv);
 		break;
 	default:
 		goto fail;
@@ -1211,7 +1218,7 @@ static int rzg2l_mod_clock_endisable(struct clk_hw *hw, bool enable)
 	}
 
 	dev_dbg(dev, "CLK_ON 0x%x/%pC %s\n", CLK_ON_R(reg), hw->clk,
-		enable ? "ON" : "OFF");
+		str_on_off(enable));
 
 	value = bitmask << 16;
 	if (enable)
@@ -1228,8 +1235,8 @@ static int rzg2l_mod_clock_endisable(struct clk_hw *hw, bool enable)
 	error = readl_poll_timeout_atomic(priv->base + CLK_MON_R(reg), value,
 					  value & bitmask, 0, 10);
 	if (error)
-		dev_err(dev, "Failed to enable CLK_ON %p\n",
-			priv->base + CLK_ON_R(reg));
+		dev_err(dev, "Failed to enable CLK_ON 0x%x/%pC\n",
+			CLK_ON_R(reg), hw->clk);
 
 	return error;
 }
@@ -1337,16 +1344,12 @@ rzg2l_cpg_register_mod_clk(const struct rzg2l_mod_clk *mod,
 	struct clk *parent, *clk;
 	const char *parent_name;
 	unsigned int i;
+	int ret;
 
 	WARN_DEBUG(id < priv->num_core_clks);
 	WARN_DEBUG(id >= priv->num_core_clks + priv->num_mod_clks);
 	WARN_DEBUG(mod->parent >= priv->num_core_clks + priv->num_mod_clks);
 	WARN_DEBUG(PTR_ERR(priv->clks[id]) != -ENOENT);
-
-	if (!mod->name) {
-		/* Skip NULLified clock */
-		return;
-	}
 
 	parent = priv->clks[mod->parent];
 	if (IS_ERR(parent)) {
@@ -1380,10 +1383,13 @@ rzg2l_cpg_register_mod_clk(const struct rzg2l_mod_clk *mod,
 	clock->priv = priv;
 	clock->hw.init = &init;
 
-	clk = clk_register(NULL, &clock->hw);
-	if (IS_ERR(clk))
+	ret = devm_clk_hw_register(dev, &clock->hw);
+	if (ret) {
+		clk = ERR_PTR(ret);
 		goto fail;
+	}
 
+	clk = clock->hw.clk;
 	dev_dbg(dev, "Module clock %pC at %lu Hz\n", clk, clk_get_rate(clk));
 	priv->clks[id] = clk;
 
@@ -1534,28 +1540,6 @@ static int rzg2l_cpg_reset_controller_register(struct rzg2l_cpg_priv *priv)
 	return devm_reset_controller_register(priv->dev, &priv->rcdev);
 }
 
-static bool rzg2l_cpg_is_pm_clk(struct rzg2l_cpg_priv *priv,
-				const struct of_phandle_args *clkspec)
-{
-	const struct rzg2l_cpg_info *info = priv->info;
-	unsigned int id;
-	unsigned int i;
-
-	if (clkspec->args_count != 2)
-		return false;
-
-	if (clkspec->args[0] != CPG_MOD)
-		return false;
-
-	id = clkspec->args[1] + info->num_total_core_clks;
-	for (i = 0; i < info->num_no_pm_mod_clks; i++) {
-		if (info->no_pm_mod_clks[i] == id)
-			return false;
-	}
-
-	return true;
-}
-
 /**
  * struct rzg2l_cpg_pm_domains - RZ/G2L PM domains data structure
  * @onecell_data: cell data
@@ -1580,45 +1564,73 @@ struct rzg2l_cpg_pd {
 	u16 id;
 };
 
+static bool rzg2l_cpg_is_pm_clk(struct rzg2l_cpg_pd *pd,
+				const struct of_phandle_args *clkspec)
+{
+	if (clkspec->np != pd->genpd.dev.of_node || clkspec->args_count != 2)
+		return false;
+
+	switch (clkspec->args[0]) {
+	case CPG_MOD: {
+		struct rzg2l_cpg_priv *priv = pd->priv;
+		const struct rzg2l_cpg_info *info = priv->info;
+		unsigned int id = clkspec->args[1];
+
+		if (id >= priv->num_mod_clks)
+			return false;
+
+		id += info->num_total_core_clks;
+
+		for (unsigned int i = 0; i < info->num_no_pm_mod_clks; i++) {
+			if (info->no_pm_mod_clks[i] == id)
+				return false;
+		}
+
+		return true;
+	}
+
+	case CPG_CORE:
+	default:
+		return false;
+	}
+}
+
 static int rzg2l_cpg_attach_dev(struct generic_pm_domain *domain, struct device *dev)
 {
 	struct rzg2l_cpg_pd *pd = container_of(domain, struct rzg2l_cpg_pd, genpd);
-	struct rzg2l_cpg_priv *priv = pd->priv;
 	struct device_node *np = dev->of_node;
 	struct of_phandle_args clkspec;
 	bool once = true;
 	struct clk *clk;
+	unsigned int i;
 	int error;
-	int i = 0;
 
-	while (!of_parse_phandle_with_args(np, "clocks", "#clock-cells", i,
-					   &clkspec)) {
-		if (rzg2l_cpg_is_pm_clk(priv, &clkspec)) {
-			if (once) {
-				once = false;
-				error = pm_clk_create(dev);
-				if (error) {
-					of_node_put(clkspec.np);
-					goto err;
-				}
-			}
-			clk = of_clk_get_from_provider(&clkspec);
+	for (i = 0; !of_parse_phandle_with_args(np, "clocks", "#clock-cells", i, &clkspec); i++) {
+		if (!rzg2l_cpg_is_pm_clk(pd, &clkspec)) {
 			of_node_put(clkspec.np);
-			if (IS_ERR(clk)) {
-				error = PTR_ERR(clk);
-				goto fail_destroy;
-			}
-
-			error = pm_clk_add_clk(dev, clk);
-			if (error) {
-				dev_err(dev, "pm_clk_add_clk failed %d\n",
-					error);
-				goto fail_put;
-			}
-		} else {
-			of_node_put(clkspec.np);
+			continue;
 		}
-		i++;
+
+		if (once) {
+			once = false;
+			error = pm_clk_create(dev);
+			if (error) {
+				of_node_put(clkspec.np);
+				goto err;
+			}
+		}
+		clk = of_clk_get_from_provider(&clkspec);
+		of_node_put(clkspec.np);
+		if (IS_ERR(clk)) {
+			error = PTR_ERR(clk);
+			goto fail_destroy;
+		}
+
+		error = pm_clk_add_clk(dev, clk);
+		if (error) {
+			dev_err(dev, "pm_clk_add_clk failed %d\n", error);
+			goto fail_put;
+		}
 	}
 
 	return 0;
@@ -1677,23 +1689,31 @@ static int rzg2l_cpg_power_off(struct generic_pm_domain *domain)
 	return 0;
 }
 
-static int __init rzg2l_cpg_pd_setup(struct rzg2l_cpg_pd *pd, bool always_on)
+static int __init rzg2l_cpg_pd_setup(struct rzg2l_cpg_pd *pd)
 {
+	bool always_on = !!(pd->genpd.flags & GENPD_FLAG_ALWAYS_ON);
 	struct dev_power_governor *governor;
+	int ret;
+
+	if (always_on)
+		governor = &pm_domain_always_on_gov;
+	else
+		governor = &simple_qos_governor;
 
 	pd->genpd.flags |= GENPD_FLAG_PM_CLK | GENPD_FLAG_ACTIVE_WAKEUP;
 	pd->genpd.attach_dev = rzg2l_cpg_attach_dev;
 	pd->genpd.detach_dev = rzg2l_cpg_detach_dev;
-	if (always_on) {
-		pd->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
-		governor = &pm_domain_always_on_gov;
-	} else {
-		pd->genpd.power_on = rzg2l_cpg_power_on;
-		pd->genpd.power_off = rzg2l_cpg_power_off;
-		governor = &simple_qos_governor;
-	}
+	pd->genpd.power_on = rzg2l_cpg_power_on;
+	pd->genpd.power_off = rzg2l_cpg_power_off;
 
-	return pm_genpd_init(&pd->genpd, governor, !always_on);
+	ret = pm_genpd_init(&pd->genpd, governor, !always_on);
+	if (ret)
+		return ret;
+
+	if (always_on)
+		ret = rzg2l_cpg_power_on(&pd->genpd);
+
+	return ret;
 }
 
 static int __init rzg2l_cpg_add_clk_domain(struct rzg2l_cpg_priv *priv)
@@ -1708,8 +1728,9 @@ static int __init rzg2l_cpg_add_clk_domain(struct rzg2l_cpg_priv *priv)
 		return -ENOMEM;
 
 	pd->genpd.name = np->name;
+	pd->genpd.flags = GENPD_FLAG_ALWAYS_ON;
 	pd->priv = priv;
-	ret = rzg2l_cpg_pd_setup(pd, true);
+	ret = rzg2l_cpg_pd_setup(pd);
 	if (ret)
 		return ret;
 
@@ -1774,7 +1795,6 @@ static int __init rzg2l_cpg_add_pm_domains(struct rzg2l_cpg_priv *priv)
 		return ret;
 
 	for (unsigned int i = 0; i < info->num_pm_domains; i++) {
-		bool always_on = !!(info->pm_domains[i].flags & RZG2L_PD_F_ALWAYS_ON);
 		struct rzg2l_cpg_pd *pd;
 
 		pd = devm_kzalloc(dev, sizeof(*pd), GFP_KERNEL);
@@ -1782,19 +1802,14 @@ static int __init rzg2l_cpg_add_pm_domains(struct rzg2l_cpg_priv *priv)
 			return -ENOMEM;
 
 		pd->genpd.name = info->pm_domains[i].name;
+		pd->genpd.flags = info->pm_domains[i].genpd_flags;
 		pd->conf = info->pm_domains[i].conf;
 		pd->id = info->pm_domains[i].id;
 		pd->priv = priv;
 
-		ret = rzg2l_cpg_pd_setup(pd, always_on);
+		ret = rzg2l_cpg_pd_setup(pd);
 		if (ret)
 			return ret;
-
-		if (always_on) {
-			ret = rzg2l_cpg_power_on(&pd->genpd);
-			if (ret)
-				return ret;
-		}
 
 		domains->domains[i] = &pd->genpd;
 		/* Parent should be on the very first entry of info->pm_domains[]. */
